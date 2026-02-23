@@ -1,0 +1,129 @@
+# ============================================================================
+# ENEO MODULES — docker-compose.modules.yml (Definitive)
+# ============================================================================
+# Each module is a BFF: serves UI + proxies API calls to backend internally.
+# Adding a module ONLY requires changes to THIS file + .env + env_modules.env.
+# docker-compose.core.yml NEVER changes.
+#
+# Auth model:
+#   User auth:    SSO cookie on .sundsvall.se (set by backend)
+#   Service auth: sk_ API key per module (created in Eneo admin UI)
+#
+# Usage:
+#   docker compose -f docker-compose.core.yml -f docker-compose.modules.yml \
+#                  --profile speech-to-text up -d
+# ============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Speech-to-text module
+  # --------------------------------------------------------------------------
+  # UI + BFF for the Tal-till-text sequential flow pipeline.
+  # Uses user's SSO cookie for authenticated requests.
+  # Uses STT_API_KEY (sk_ key) for service-level backend calls.
+  # --------------------------------------------------------------------------
+  mod-speech-to-text:
+    profiles: ["speech-to-text", "all-modules"]
+    image: ghcr.io/eneo-ai/eneo-mod-speech-to-text:${ENEO_VERSION:-latest}
+    container_name: eneo_mod_speech_to_text
+    restart: unless-stopped
+    environment:
+      # Internal backend URL (server-side only, never exposed to browser)
+      - ENEO_BACKEND_URL=http://eneo_backend:8000
+      # Public Eneo URL (for auth broker redirects)
+      - ENEO_PUBLIC_URL=https://${ENEO_DOMAIN}
+      # Public URL of this module (for auth return_to callbacks)
+      - MODULE_PUBLIC_URL=https://${MODULE_TTT_DOMAIN}
+      - MODULE_ID=speech-to-text
+      # Auth strategy: eneo_sso (shared cookie) or handoff (code exchange)
+      - MODULE_AUTH_STRATEGY=${MODULE_AUTH_STRATEGY:-eneo_sso}
+    env_file: env_modules.env
+    networks:
+      - module_net
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001/health"] # Ensure the docker image has wget installed or switch to node based fetch script instead.
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=eneo_module_net"
+      # All traffic to module domain → this container (UI + BFF /api/*)
+      - "traefik.http.routers.ttt-s.rule=Host(`${MODULE_TTT_DOMAIN:-disabled.internal}`)"
+      - "traefik.http.routers.ttt-s.entrypoints=websecure"
+      - "traefik.http.routers.ttt-s.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.ttt-s.service=ttt-svc"
+      - "traefik.http.routers.ttt-s.middlewares=security-headers"
+      - "traefik.http.routers.ttt.rule=Host(`${MODULE_TTT_DOMAIN:-disabled.internal}`)"
+      - "traefik.http.routers.ttt.entrypoints=web"
+      - "traefik.http.routers.ttt.middlewares=redirect-to-https"
+      - "traefik.http.services.ttt-svc.loadbalancer.server.port=3001"
+
+  # --------------------------------------------------------------------------
+  # Widget Host module
+  # --------------------------------------------------------------------------
+  # Serves embed.js + iframe app for embedding on external municipal sites.
+  # Uses WIDGET_API_KEY (sk_ key) for ALL backend calls — no user cookies.
+  # The sk_ key is:
+  #   - Scoped to a specific space (with allowed flows)
+  #   - IP-restricted to Docker module_net CIDR (172.16.0.0/12)
+  #   - Rate-limited per key (configurable in Eneo admin UI)
+  #   - Audited per request (API Key v2 usage tracking)
+  #   - Rotatable with grace period (zero-downtime key rotation)
+  # --------------------------------------------------------------------------
+  mod-widget:
+    profiles: ["widget", "all-modules"]
+    image: ghcr.io/eneo-ai/eneo-mod-widget:${ENEO_VERSION:-latest}
+    container_name: eneo_mod_widget
+    restart: unless-stopped
+    environment:
+      - ENEO_BACKEND_URL=http://eneo_backend:8000
+      - ENEO_PUBLIC_URL=https://${ENEO_DOMAIN}
+      - MODULE_PUBLIC_URL=https://${MODULE_WIDGET_DOMAIN}
+      - MODULE_ID=widget
+    env_file: env_modules.env
+    networks:
+      - module_net
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=eneo_module_net"
+      - "traefik.http.routers.wid-s.rule=Host(`${MODULE_WIDGET_DOMAIN:-disabled.internal}`)"
+      - "traefik.http.routers.wid-s.entrypoints=websecure"
+      - "traefik.http.routers.wid-s.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.wid-s.service=wid-svc"
+      # Widget-specific CSP: controls which external sites can embed the iframe
+      - "traefik.http.middlewares.widget-csp.headers.customResponseHeaders.Content-Security-Policy=frame-ancestors 'self' ${WIDGET_FRAME_ANCESTORS:-'none'}"
+      - "traefik.http.middlewares.widget-csp.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.widget-csp.headers.contentTypeNosniff=true"
+      - "traefik.http.routers.wid-s.middlewares=widget-csp"
+      - "traefik.http.routers.wid.rule=Host(`${MODULE_WIDGET_DOMAIN:-disabled.internal}`)"
+      - "traefik.http.routers.wid.entrypoints=web"
+      - "traefik.http.routers.wid.middlewares=redirect-to-https"
+      - "traefik.http.services.wid-svc.loadbalancer.server.port=3002"
+
+  # --------------------------------------------------------------------------
+  # ADDING A NEW MODULE — Follow this pattern:
+  # --------------------------------------------------------------------------
+  # 1. cp modules/_template modules/my-module
+  # 2. Edit module.json (id, name, port)
+  # 3. Add service entry below (copy speech-to-text pattern)
+  # 4. Add MODULE_MYMOD_DOMAIN to .env
+  # 5. Create sk_ API key in Eneo admin UI (scoped, IP-restricted)
+  # 6. Add MYMOD_API_KEY=sk_xxx to env_modules.env
+  # 7. Add to CI build matrix
+  # 8. Done. ZERO changes to docker-compose.core.yml.
+  # --------------------------------------------------------------------------

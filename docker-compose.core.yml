@@ -1,0 +1,193 @@
+# ============================================================================
+# ENEO CORE — docker-compose.core.yml (Definitive)
+# ============================================================================
+# This file NEVER changes when adding modules.
+#
+# Architecture:
+#   app_net     — Frontend, Backend, Worker, Traefik. Egress OK.
+#   data_net    — DB + Redis ONLY. internal: true. No egress. No modules.
+#   module_net  — Modules ↔ Backend + Traefik. Modules call backend internally.
+#
+# Backend bridges all three networks.
+# Modules CANNOT reach DB or Redis.
+#
+# Start:
+#   docker compose -f docker-compose.core.yml up -d
+#
+# With modules:
+#   docker compose -f docker-compose.core.yml -f docker-compose.modules.yml \
+#                  --profile speech-to-text --profile widget up -d
+# ============================================================================
+
+name: eneo
+
+services:
+
+  traefik:
+    image: traefik:v3.0
+    container_name: eneo_traefik
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--api.dashboard=false"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "traefik_letsencrypt:/letsencrypt"
+    networks:
+      - app_net
+      - module_net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
+      - "traefik.http.middlewares.security-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.security-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.security-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.security-headers.headers.browserXssFilter=true"
+
+  frontend:
+    image: ghcr.io/eneo-ai/eneo-frontend:${ENEO_VERSION:-latest}
+    container_name: eneo_frontend
+    restart: unless-stopped
+    env_file: env_frontend.env
+    networks:
+      - app_net
+    depends_on:
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=eneo_app_net"
+      - "traefik.http.routers.frontend.rule=Host(`${ENEO_DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=web"
+      - "traefik.http.routers.frontend.middlewares=redirect-to-https"
+      - "traefik.http.routers.frontend-s.rule=Host(`${ENEO_DOMAIN}`)"
+      - "traefik.http.routers.frontend-s.entrypoints=websecure"
+      - "traefik.http.routers.frontend-s.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.frontend-s.priority=1"
+      - "traefik.http.routers.frontend-s.middlewares=security-headers"
+      - "traefik.http.services.frontend-svc.loadbalancer.server.port=3000"
+
+  backend:
+    image: ghcr.io/eneo-ai/eneo-backend:${ENEO_VERSION:-latest}
+    container_name: eneo_backend
+    restart: unless-stopped
+    env_file: env_backend.env
+    volumes:
+      - eneo_backend_data:/app/data
+      - eneo_temp_files:/tmp
+    networks:
+      - app_net
+      - data_net
+      - module_net
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=eneo_app_net"
+      # Backend API ONLY exposed on ENEO_DOMAIN — NEVER on module domains
+      - "traefik.http.routers.backend.rule=Host(`${ENEO_DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/openapi.json`) || PathPrefix(`/version`))"
+      - "traefik.http.routers.backend.entrypoints=web"
+      - "traefik.http.routers.backend.middlewares=redirect-to-https"
+      - "traefik.http.routers.backend-s.rule=Host(`${ENEO_DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/openapi.json`) || PathPrefix(`/version`))"
+      - "traefik.http.routers.backend-s.entrypoints=websecure"
+      - "traefik.http.routers.backend-s.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.backend-s.priority=10"
+      - "traefik.http.routers.backend-s.middlewares=security-headers"
+      - "traefik.http.services.backend-svc.loadbalancer.server.port=8000"
+
+  worker:
+    image: ghcr.io/eneo-ai/eneo-backend:${ENEO_VERSION:-latest}
+    container_name: eneo_worker
+    restart: unless-stopped
+    environment:
+      - RUN_AS_WORKER=true
+    env_file: env_backend.env
+    volumes:
+      - eneo_backend_data:/app/data
+      - eneo_temp_files:/tmp
+    networks:
+      - app_net
+      - data_net
+    depends_on:
+      - backend
+
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: eneo_db
+    restart: unless-stopped
+    env_file: env_db.env
+    volumes:
+      - eneo_postgres_data:/var/lib/postgresql/data
+    networks:
+      - data_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: eneo_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - eneo_redis_data:/data
+    networks:
+      - data_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db-init:
+    image: ghcr.io/eneo-ai/eneo-backend:${ENEO_VERSION:-latest}
+    container_name: eneo_db_init
+    command: ["python", "init_db.py"]
+    env_file: env_backend.env
+    networks:
+      - data_net
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+networks:
+  app_net:
+    driver: bridge
+  data_net:
+    driver: bridge
+    internal: true
+  module_net:
+    driver: bridge
+
+volumes:
+  eneo_postgres_data:
+  eneo_redis_data:
+  eneo_backend_data:
+  eneo_temp_files:
+  traefik_letsencrypt:
