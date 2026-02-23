@@ -78,9 +78,9 @@ Each step is an independent AI agent with its own model, prompt, tools, and secu
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════╗
-║  STEP 1: Transkribera                                                     ║
-║  Model:  KBWhisper (Berget/GDM)                                          ║
-║  Klass:  1 (public — audio transcription is not sensitive)                ║
+║  STEP 1: Transkribera                                                      ║
+║  Model:  KBWhisper (Berget/GDM)                                            ║
+║  Klass:  1 (public — audio transcription is not sensitive)                 ║
 ╠════════════════════════════════════════════════════════════════════════════╣
 ║                                                                            ║
 ║  INPUT:   flow_input → audio file (meeting.mp3)                            ║
@@ -89,8 +89,8 @@ Each step is an independent AI agent with its own model, prompt, tools, and secu
 ║  KNOWLEDGE: none                                                           ║
 ║                                                                            ║
 ║  OUTPUT (text):                                                            ║
-║  "Anna: Hej, jag vill prata om ditt stödbehov framåt.                     ║
-║   Klient: Ja, jag har haft svårt med vardagliga sysslor                   ║
+║  "Anna: Hej, jag vill prata om ditt stödbehov framåt.                      ║
+║   Klient: Ja, jag har haft svårt med vardagliga sysslor                    ║
 ║   sedan operationen i december..."                                         ║
 ║                                                                            ║
 ║  ── This raw transcript flows forward to Step 2 ──                         ║
@@ -100,39 +100,39 @@ Each step is an independent AI agent with its own model, prompt, tools, and secu
                                     ▼
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║  STEP 2: Sammanfatta och berika                                            ║
-║  Model:  GPT-4o (Azure, EU-hosted)                                        ║
-║  Klass:  2 (internal — now we're adding personal identifiers)             ║
+║  Model:  GPT-4o (Azure, EU-hosted)                                         ║
+║  Klass:  2 (internal — now we're adding personal identifiers)              ║
 ╠════════════════════════════════════════════════════════════════════════════╣
 ║                                                                            ║
 ║  INPUT:   previous_step → the transcript from Step 1                       ║
 ║                                                                            ║
 ║  PROMPT:  "Du är en journalassistent. Sammanfatta mötet i                  ║
 ║            strukturerat JSON-format. Hämta patientdata via                 ║
-║            MCP-verktyget lookup_patient med ärendenummer                    ║
+║            MCP-verktyget lookup_patient med ärendenummer                   ║
 ║            {{flow_input.ärendenr}}. Inkludera fält:                        ║
 ║            patient_id, summary, key_decisions, next_steps."                ║
 ║                                                                            ║
 ║  MCP TOOLS (restricted allowlist):                                         ║
-║    ┌──────────────────┐    ┌──────────────────────┐                       ║
+║    ┌──────────────────┐    ┌──────────────────────┐                        ║
 ║    │ lookup_patient   │    │ fetch_case            │                       ║
 ║    │ → HSA-katalog    │    │ → Ärendesystem API    │                       ║
 ║    │   (staff + client│    │   (case history)      │                       ║
-║    │    registry)     │    │                        │                       ║
-║    └──────────────────┘    └──────────────────────┘                       ║
+║    │    registry)     │    │                        │                      ║
+║    └──────────────────┘    └──────────────────────┘                        ║
 ║                                                                            ║
-║  KNOWLEDGE BASE: "Journalriktlinjer"                                      ║
+║  KNOWLEDGE BASE: "Journalriktlinjer"                                       ║
 ║    (RAG retrieves relevant sections about how to structure                 ║
-║     social service journal entries per Socialtjänstlagen ch. 11 §5)       ║
+║     social service journal entries per Socialtjänstlagen ch. 11 §5)        ║
 ║                                                                            ║
 ║  OUTPUT (json):                                                            ║
 ║  {                                                                         ║
-║    "patient_id": "P-198705-2341",                                         ║
-║    "case_number": "2026-BIS-0847",                                        ║
-║    "handler": "Anna Lindström",                                           ║
-║    "summary": "Klienten beskriver fortsatta svårigheter...",              ║
-║    "key_decisions": ["Utöka hemtjänst till 4x/vecka"],                    ║
-║    "next_steps": ["Uppföljning 2026-03-15"],                              ║
-║    "meeting_date": "2026-02-20"                                           ║
+║    "patient_id": "P-198705-2341",                                          ║
+║    "case_number": "2026-BIS-0847",                                         ║
+║    "handler": "Anna Lindström",                                            ║
+║    "summary": "Klienten beskriver fortsatta svårigheter...",               ║
+║    "key_decisions": ["Utöka hemtjänst till 4x/vecka"],                     ║
+║    "next_steps": ["Uppföljning 2026-03-15"],                               ║
+║    "meeting_date": "2026-02-20"                                            ║
 ║  }                                                                         ║
 ║                                                                            ║
 ║  ── Structured JSON flows forward to Step 3 ──                             ║
@@ -141,51 +141,51 @@ Each step is an independent AI agent with its own model, prompt, tools, and secu
                                     │
                                     ▼
 ╔════════════════════════════════════════════════════════════════════════════╗
-║  STEP 3: Skapa journalanteckning                                          ║
-║  Model:  KBWhisper (on-premise, sekretessdata)                            ║
-║  Klass:  3 (secret — full journal with personal details)                  ║
+║  STEP 3: Skapa journalanteckning                                           ║
+║  Model:  KBWhisper (on-premise, sekretessdata)                             ║
+║  Klass:  3 (secret — full journal with personal details)                   ║
 ╠════════════════════════════════════════════════════════════════════════════╣
 ║                                                                            ║
 ║  INPUT:   all_previous_steps                                               ║
-║           ┌─────────────────────────────────────────────┐                 ║
+║           ┌─────────────────────────────────────────────┐                  ║
 ║           │ <step_1>                                     │                 ║
 ║           │   Full transcript text...                    │                 ║
 ║           │ </step_1>                                    │                 ║
 ║           │ <step_2>                                     │                 ║
 ║           │   {"patient_id":"P-198705-2341",...}         │                 ║
 ║           │ </step_2>                                    │                 ║
-║           └─────────────────────────────────────────────┘                 ║
+║           └─────────────────────────────────────────────┘                  ║
 ║                                                                            ║
 ║  PROMPT:  "Fyll i journalmallen. Använd                                    ║
 ║            {{step_2.output.summary}} som sammanfattning.                   ║
 ║            Handläggare: {{flow_input.handläggare}}.                        ║
-║            Patient: {{step_2.output.patient_id}}.                         ║
-║            Inkludera ordagrant citat från transkriberingen                  ║
-║            där klienten uttrycker sina behov."                              ║
+║            Patient: {{step_2.output.patient_id}}.                          ║
+║            Inkludera ordagrant citat från transkriberingen                 ║
+║            där klienten uttrycker sina behov."                             ║
 ║                                                                            ║
 ║  MCP TOOLS (restricted allowlist):                                         ║
 ║    ┌──────────────────┐                                                    ║
-║    │ fill_template    │  ← fills a DOCX template with structured          ║
-║    │ → Mallsystem     │     data from the JSON + transcript               ║
+║    │ fill_template    │  ← fills a DOCX template with structured           ║
+║    │ → Mallsystem     │     data from the JSON + transcript                ║
 ║    └──────────────────┘                                                    ║
 ║                                                                            ║
-║  KNOWLEDGE BASE: "Journalmallar"                                          ║
+║  KNOWLEDGE BASE: "Journalmallar"                                           ║
 ║    (RAG retrieves the correct template format for                          ║
 ║     "Biståndshandläggning — Mötesanteckning")                              ║
 ║                                                                            ║
 ║  OUTPUT (docx):                                                            ║
-║    → journalanteckning_2026-BIS-0847.docx                                 ║
+║    → journalanteckning_2026-BIS-0847.docx                                  ║
 ║                                                                            ║
 ║  OUTPUT MODE: http_post                                                    ║
-║    → POST https://journal.sundsvall.se/api/v1/entries                     ║
-║      Body: {"case": "{{step_2.output.case_number}}",                      ║
+║    → POST https://journal.sundsvall.se/api/v1/entries                      ║
+║      Body: {"case": "{{step_2.output.case_number}}",                       ║
 ║             "handler": "{{flow_input.handläggare}}",                       ║
-║             "document_id": "{{step_3.output.file_id}}"}                   ║
-║      Headers: {"Authorization": "Bearer sk_journal_xxx"}                  ║
+║             "document_id": "{{step_3.output.file_id}}"}                    ║
+║      Headers: {"Authorization": "Bearer sk_journal_xxx"}                   ║
 ║                                                                            ║
-║  K3 data CANNOT flow backwards to K1 or K2 models                         ║
+║  K3 data CANNOT flow backwards to K1 or K2 models                          ║
 ║  K3 output CANNOT be sent to external webhooks                             ║
-║     (journal.sundsvall.se is internal → allowed)                          ║
+║     (journal.sundsvall.se is internal → allowed)                           ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 ```
 
@@ -328,45 +328,44 @@ In the STT example: KBWhisper via Berget/GDM (K1) transcribes audio (not sensiti
 The platform runs on three Docker networks with strict isolation:
 
 ```
-                        INTERNET
-                           │
-                  ┌────────┴────────┐
-                  │     TRAEFIK     │
-                  │  (reverse proxy)│
-                  └───┬─────────┬───┘
-                      │         │
-  ┌───────────────────│─────────│──────────────────────────────────────┐
-  │  app_net          │         │                                      │
-  │                   ▼         │                                      │
-  │    ┌──────────┐   │    ┌──────────┐    ┌──────────┐               │
-  │    │ Frontend │   │    │  Worker  │    │ Backend  │               │
-  │    │ (Svelte) │   │    │  (ARQ)   │    │ (FastAPI)│               │
-  │    └──────────┘   │    └────┬─────┘    └──┬──┬────┘               │
-  │                   │         │             │  │                     │
-  └───────────────────│─────────│─────────────│──│─────────────────────┘
-                      │         │             │  │
-  ┌───────────────────│─────────│─────────────│──│─────────────────────┐
-  │  data_net         │         │             │  │                     │
-  │  (internal: true  │         ▼             ▼  │                     │
-  │   — no egress)    │    ┌──────────┐  ┌──────────┐                 │
-  │                   │    │ PostgreSQL│  │  Redis   │                 │
-  │                   │    │ + pgvector│  │          │                 │
-  │                   │    └──────────┘  └──────────┘                 │
-  └───────────────────│────────────────────────────────────────────────┘
-                      │                      │
-  ┌───────────────────│──────────────────────│─────────────────────────┐
-  │  module_net       │                      │                         │
-  │                   ▼                      ▼                         │
-  │    ┌───────────────────┐  ┌───────────────────┐                   │
-  │    │  Speech-to-Text  │  │    Widget Host    │                   │
-  │    │  (BFF module)    │  │   (BFF module)    │                   │
-  │    │                  │  │                    │                   │
-  │    │  → backend:8000  │  │  → backend:8000   │                   │
-  │    └───────────────────┘  └───────────────────┘                   │
-  │                                                                    │
-  │    Modules call backend internally.                                │
-  │    Modules CANNOT reach PostgreSQL or Redis.                       │
-  └────────────────────────────────────────────────────────────────────┘
+                          INTERNET
+                             │
+                    ┌────────┴────────┐
+                    │     TRAEFIK     │
+                    │  (reverse proxy)│
+                    └──┬──────────┬───┘
+                       │          │
+ ┏━━━━━━━━━━━━━━━━━━━━━│━━━━━━━━━━│━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+ ┃  app_net             │          │                                       ┃
+ ┃                      ▼          │                                       ┃
+ ┃   ┌──────────┐  ┌──────────┐   │   ┌─────────────┐                      ┃
+ ┃   │ Frontend │  │  Worker  │   │   │   Backend   │◄── bridges all 3     ┃
+ ┃   │ (Svelte) │  │  (ARQ)   │   │   │  (FastAPI)  │    networks          ┃
+ ┃   └──────────┘  └─────┬────┘   │   └──┬───────┬──┘                      ┃
+ ┃                        │        │      │       │                        ┃
+ ┗━━━━━━━━━━━━━━━━━━━━━━━━│━━━━━━━━│━━━━━━│━━━━━━━│━━━━━━━━━━━━━━━━━━━━━━━━┛
+                          │        │      │       │
+ ┏━━━━━━━━━━━━━━━━━━━━━━━━│━━━━━━━━│━━━━━━│━━━━━━━│━━━━━━━━━━━━━━━━━━━━━━━━┓
+ ┃  data_net              │        │      │       │                        ┃
+ ┃  (internal: true       ▼        │      ▼       │                        ┃
+ ┃   — no egress)    ┌──────────┐  │  ┌────────┐  │                        ┃
+ ┃                   │PostgreSQL│  │  │ Redis  │  │                        ┃
+ ┃                   │+ pgvector│  │  └────────┘  │                        ┃
+ ┃                   └──────────┘  │              │                        ┃
+ ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│━━━━━━━━━━━━━━│━━━━━━━━━━━━━━━━━━━━━━━━┛
+                                   │              │
+ ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│━━━━━━━━━━━━━━│━━━━━━━━━━━━━━━━━━━━━━━━┓
+ ┃  module_net                     ▼              ▼                        ┃
+ ┃                                                                         ┃
+ ┃   ┌─────────────────────┐  ┌─────────────────────┐                      ┃
+ ┃   │   Speech-to-Text   │  │    Widget Host      │                       ┃
+ ┃   │   (BFF module)     │  │   (BFF module)      │                       ┃
+ ┃   │   → backend:8000   │  │   → backend:8000    │                       ┃
+ ┃   └─────────────────────┘  └─────────────────────┘                      ┃
+ ┃                                                                         ┃
+ ┃   Modules call backend internally.                                      ┃
+ ┃   Modules CANNOT reach PostgreSQL or Redis.                             ┃
+ ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
 **app_net** — Frontend, Backend, Worker, and Traefik. Outbound internet access allowed (for LLM APIs, OIDC providers, external webhooks).
@@ -386,22 +385,29 @@ Reference: [docker-compose.core.yml](./docker-compose.core.yml) and [docker-comp
 The Speech-to-Text module is not the flow itself. It is a specialized UI wrapper around a standard Eneo flow:
 
 ```
-Browser (taltilltext.sundsvall.se)
-   │
-   ▼
-STT Module (BFF)
-   │── Serves audio recorder widget, drag-and-drop upload
-   │── Custom progress visualization per step
-   │── Domain-specific UX for social workers
-   │
-   └── /api/* routes (server-side)
-          │
-          ▼
-       http://eneo_backend:8000 (internal, via module_net)
-          │
-          ├── POST /api/v1/flows/{id}/run    (trigger the flow)
-          ├── GET  /api/v1/flow-runs/{id}    (poll for results)
-          └── WebSocket for live step progress
+ ┌────────────────────────────────────────────────────────────────┐
+ │  Browser (taltilltext.sundsvall.se)                            │
+ └──────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+ ┌────────────────────────────────────────────────────────────────┐
+ │  STT Module (BFF)                                              │
+ │                                                                │
+ │  ├── Audio recorder widget, drag-and-drop upload               │
+ │  ├── Custom progress visualization per step                    │
+ │  ├── Domain-specific UX for social workers                     │
+ │  │                                                             │
+ │  └── /api/* routes (server-side) ─────────────────┐            │
+ └────────────────────────────────────────────────────│───────────┘
+                                                      │
+                                                      ▼
+ ┌────────────────────────────────────────────────────────────────┐
+ │  http://eneo_backend:8000 (internal, via module_net)           │
+ │                                                                │
+ │  ├── POST /api/v1/flows/{id}/run    (trigger the flow)         │
+ │  ├── GET  /api/v1/flow-runs/{id}    (poll for results)         │
+ │  └── WebSocket                      (live step progress)       │
+ └────────────────────────────────────────────────────────────────┘
 ```
 
 The module provides the user experience. The backend provides the flow engine, security enforcement, and audit trail. If you wanted to build a different UI for the same flow — a mobile app, a different web design, an API-only integration — you would build a different module or call the backend API directly. The flow definition stays the same.
