@@ -29,7 +29,7 @@ Det här repot innehåller arkitekturdokumenten för Eneos nya funktioner: Flöd
 Here is the overall model. A **Flow** is a sequential AI pipeline. A **Module** is a standalone UI service (following the BFF — Backend For Frontend — pattern) that triggers flows via the backend API.
 
 ```mermaid
-graph LR
+flowchart LR
     subgraph Module["Module (BFF)"]
         UI["Specialized UI"]
         BFF["/api/* proxy"]
@@ -38,13 +38,17 @@ graph LR
     subgraph Eneo["Eneo Core"]
         API["Backend API"]
         Engine["Flow Engine"]
-        Worker["Worker\n(ARQ task queue)"]
+        Worker["`Worker
+(ARQ task queue)`"]
     end
 
     subgraph Flow["Flow Pipeline"]
-        S1["Step 1\n(own model, tools, KB)"]
-        S2["Step 2\n(own model, tools, KB)"]
-        S3["Step 3\n(own model, tools, KB)"]
+        S1["`Step 1
+own model, tools, KB`"]
+        S2["`Step 2
+own model, tools, KB`"]
+        S3["`Step 3
+own model, tools, KB`"]
     end
 
     UI --> BFF
@@ -222,16 +226,20 @@ Without modules, every new capability (STT, document scanning, form builder, etc
 **The BFF (Backend For Frontend) pattern:**
 
 ```mermaid
-graph TB
-    Browser["Browser\ntaltilltext.sundsvall.se"]
+flowchart TB
+    Browser["`Browser
+taltilltext.sundsvall.se`"]
 
     subgraph Module["STT Module Container"]
-        ModUI["Module UI\n(audio recorder, progress view)"]
-        ModAPI["Module /api/* routes\n(BFF proxy layer)"]
+        ModUI["`Module UI
+(audio recorder, progress view)`"]
+        ModAPI["`Module /api/* routes
+(BFF proxy layer)`"]
     end
 
     subgraph Core["Eneo Core"]
-        Backend["Backend API\nhttp://eneo_backend:8000"]
+        Backend["`Backend API
+eneo_backend:8000`"]
         DB["PostgreSQL + Redis"]
     end
 
@@ -296,9 +304,12 @@ Swedish municipal data is classified into three levels:
 **Monotonic enforcement:** Data can only flow to models of equal or higher classification. K1 → K2 → K3 is allowed (escalation). K3 → K1 is blocked. This is validated when the flow is saved, not at runtime — if you try to create a flow where a K3 step feeds into a K1 step, the API rejects it immediately.
 
 ```mermaid
-graph LR
-    K1["K1\nKBWhisper (Berget/GDM)"] -->|"allowed"| K2["K2\nGPT-4o (EU)"]
-    K2 -->|"allowed"| K3["K3\nKBWhisper (on-premise)"]
+flowchart LR
+    K1["`**K1**
+KBWhisper (Berget/GDM)`"] -->|"allowed"| K2["`**K2**
+GPT-4o (EU)`"]
+    K2 -->|"allowed"| K3["`**K3**
+KBWhisper (on-premise)`"]
     K3 -.->|"BLOCKED at save time"| K1
     K3 -.->|"BLOCKED"| K2
 
