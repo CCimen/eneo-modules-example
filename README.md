@@ -4,9 +4,9 @@ Reference architecture for two new Eneo capabilities: **Flows** (sequential AI p
 
 ---
 
-## Lasanvisning
+## Läsanvisning
 
-Det har repot innehaller arkitekturdokumenten for Eneos nya funktioner: Floden (sekventiella AI-pipelines) och Moduler (sjalvstandiga tillaggstjanster med BFF-monster). Malsattningen ar att ge teamet en gemensam bild av hur vi bygger sakra, granskningsbara AI-arbetsfloden for offentlig sektor. Borja med scenariot "Tal-till-text" langre ner — det gor resten av dokumentet konkret.
+Det här repot innehåller arkitekturdokumenten för Eneos nya funktioner: Flöden (sekventiella AI-pipelines) och Moduler (självständiga tilläggstjänster med BFF-mönster). Målsättningen är att ge teamet en gemensam bild av hur vi bygger säkra, granskningsbara AI-arbetsflöden för offentlig sektor. Börja med scenariot "Tal-till-text" längre ner — det gör resten av dokumentet konkret.
 
 ---
 
@@ -62,7 +62,7 @@ The module handles the user experience. The backend handles execution, security,
 
 A social worker in Sundsvall finishes a client meeting about welfare support. They recorded the audio. Today, turning that recording into a formal journal entry takes 45 minutes of manual work: transcribe, look up patient data, cross-reference guidelines, write the entry, post it to the journal system.
 
-With an Eneo flow, it takes one button press. The user visits `taltilltext.sundsvall.se` (the STT module), uploads the audio, fills in case number and handler name, and hits "Kor flodet." Three AI steps execute in sequence:
+With an Eneo flow, it takes one button press. The user visits `taltilltext.sundsvall.se` (the STT module), uploads the audio, fills in case number and handler name, and hits "Kör flödet." Three AI steps execute in sequence:
 
 ![Speech-to-Text Flow Architecture](./taltilltextflow.excalidraw.png)
 
@@ -73,117 +73,116 @@ With an Eneo flow, it takes one button press. The user visits `taltilltext.sunds
 Each step is an independent AI agent with its own model, prompt, tools, and security classification. Data flows strictly forward — Step 1 can never see Step 3's output.
 
 ```
-╔══════════════════════════════════════════════════════════════════════╗
-║  STEP 1: Transkribera                                               ║
-║  Model:  Whisper (Azure OpenAI)                                     ║
-║  Klass:  1 (public — audio transcription is not sensitive)          ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  INPUT:   flow_input → audio file (meeting.mp3)                      ║
-║  PROMPT:  "Transkribera lydelsen ordagrant pa svenska."              ║
-║  MCP:     none                                                       ║
-║  KNOWLEDGE: none                                                     ║
-║                                                                      ║
-║  OUTPUT (text):                                                      ║
-║  "Anna: Hej, jag vill prata om ditt stodbehov framat.               ║
-║   Klient: Ja, jag har haft svart med vardagliga sysslor             ║
-║   sedan operationen i december..."                                   ║
-║                                                                      ║
-║  ── This raw transcript flows forward to Step 2 ──                   ║
-║     Classification: K1 → K2 (escalation allowed)                     ║
-╚══════════════════════════════════════════════════════════════════════╝
-                              │
-                              ▼
-╔══════════════════════════════════════════════════════════════════════╗
-║  STEP 2: Sammanfatta och berika                                      ║
-║  Model:  GPT-4o (Azure, EU-hosted)                                  ║
-║  Klass:  2 (internal — now we're adding personal identifiers)       ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  INPUT:   previous_step → the transcript from Step 1                 ║
-║                                                                      ║
-║  PROMPT:  "Du ar en journalassistent. Sammanfatta motet i            ║
-║            strukturerat JSON-format. Hamta patientdata via           ║
-║            MCP-verktyget lookup_patient med arendenummer              ║
-║            {{flow_input.arendenr}}. Inkludera falt:                  ║
-║            patient_id, summary, key_decisions, next_steps."          ║
-║                                                                      ║
-║  MCP TOOLS (restricted allowlist):                                   ║
-║    ┌──────────────────┐    ┌──────────────────────┐                 ║
-║    │ lookup_patient   │    │ fetch_case            │                 ║
-║    │ → HSA-katalog    │    │ → Arendesystem API    │                 ║
-║    │   (staff + client│    │   (case history)      │                 ║
-║    │    registry)     │    │                        │                 ║
-║    └──────────────────┘    └──────────────────────┘                 ║
-║                                                                      ║
-║  KNOWLEDGE BASE: "Journalriktlinjer"                                ║
-║    (RAG retrieves relevant sections about how to                     ║
-║     structure social service journal entries per                     ║
-║     Socialtjanstlagen chapter 11 §5)                                 ║
-║                                                                      ║
-║  OUTPUT (json):                                                      ║
-║  {                                                                   ║
-║    "patient_id": "P-198705-2341",                                   ║
-║    "case_number": "2026-BIS-0847",                                  ║
-║    "handler": "Anna Lindstrom",                                     ║
-║    "summary": "Klienten beskriver fortsatta svarigheter...",        ║
-║    "key_decisions": ["Utoka hemtjanst till 4x/vecka"],              ║
-║    "next_steps": ["Uppfoljning 2026-03-15"],                        ║
-║    "meeting_date": "2026-02-20"                                     ║
-║  }                                                                   ║
-║                                                                      ║
-║  ── Structured JSON flows forward to Step 3 ──                       ║
-║     Classification: K2 → K3 (escalation allowed)                     ║
-╚══════════════════════════════════════════════════════════════════════╝
-                              │
-                              ▼
-╔══════════════════════════════════════════════════════════════════════╗
-║  STEP 3: Skapa journalanteckning                                    ║
-║  Model:  Llama 3.1 70B (on-premise, Sundsvall datacenter)          ║
-║  Klass:  3 (secret — full journal with personal details)            ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  INPUT:   all_previous_steps                                         ║
-║           ┌───────────────────────────────────────────┐             ║
-║           │ <step_1>                                   │             ║
-║           │   Full transcript text...                  │             ║
-║           │ </step_1>                                  │             ║
-║           │ <step_2>                                   │             ║
-║           │   {"patient_id":"P-198705-2341",...}       │             ║
-║           │ </step_2>                                  │             ║
-║           └───────────────────────────────────────────┘             ║
-║                                                                      ║
-║  PROMPT:  "Fyll i journalmallen. Anvand                              ║
-║            {{step_2.output.summary}} som sammanfattning.             ║
-║            Handlaggare: {{flow_input.handlaggare}}.                  ║
-║            Patient: {{step_2.output.patient_id}}.                   ║
-║            Inkludera ordagrant citat fran transkriberingen            ║
-║            dar klienten uttrycker sina behov."                        ║
-║                                                                      ║
-║  MCP TOOLS (restricted allowlist):                                   ║
-║    ┌──────────────────┐                                              ║
-║    │ fill_template    │  ← fills a DOCX template with structured    ║
-║    │ → Mallsystem     │     data from the JSON + transcript         ║
-║    └──────────────────┘                                              ║
-║                                                                      ║
-║  KNOWLEDGE BASE: "Journalmallar"                                    ║
-║    (RAG retrieves the correct template format for                    ║
-║     "Bistandshandlaggning — Motesanteckning")                        ║
-║                                                                      ║
-║  OUTPUT (docx):                                                      ║
-║    → journalanteckning_2026-BIS-0847.docx                           ║
-║                                                                      ║
-║  OUTPUT MODE: http_post                                              ║
-║    → POST https://journal.sundsvall.se/api/v1/entries               ║
-║      Body: {"case": "{{step_2.output.case_number}}",                ║
-║             "handler": "{{flow_input.handlaggare}}",                 ║
-║             "document_id": "{{step_3.output.file_id}}"}             ║
-║      Headers: {"Authorization": "Bearer sk_journal_xxx"}            ║
-║                                                                      ║
-║  K3 data CANNOT flow backwards to K1 or K2 models                   ║
-║  K3 output CANNOT be sent to external webhooks                       ║
-║     (journal.sundsvall.se is internal → allowed)                    ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════════════════════╗
+║  STEP 1: Transkribera                                                     ║
+║  Model:  KBWhisper (Berget/GDM)                                          ║
+║  Klass:  1 (public — audio transcription is not sensitive)                ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║                                                                            ║
+║  INPUT:   flow_input → audio file (meeting.mp3)                            ║
+║  PROMPT:  "Transkribera lydelsen ordagrant på svenska."                    ║
+║  MCP:     none                                                             ║
+║  KNOWLEDGE: none                                                           ║
+║                                                                            ║
+║  OUTPUT (text):                                                            ║
+║  "Anna: Hej, jag vill prata om ditt stödbehov framåt.                     ║
+║   Klient: Ja, jag har haft svårt med vardagliga sysslor                   ║
+║   sedan operationen i december..."                                         ║
+║                                                                            ║
+║  ── This raw transcript flows forward to Step 2 ──                         ║
+║     Classification: K1 → K2 (escalation allowed)                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+                                    │
+                                    ▼
+╔════════════════════════════════════════════════════════════════════════════╗
+║  STEP 2: Sammanfatta och berika                                            ║
+║  Model:  GPT-4o (Azure, EU-hosted)                                        ║
+║  Klass:  2 (internal — now we're adding personal identifiers)             ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║                                                                            ║
+║  INPUT:   previous_step → the transcript from Step 1                       ║
+║                                                                            ║
+║  PROMPT:  "Du är en journalassistent. Sammanfatta mötet i                  ║
+║            strukturerat JSON-format. Hämta patientdata via                 ║
+║            MCP-verktyget lookup_patient med ärendenummer                    ║
+║            {{flow_input.ärendenr}}. Inkludera fält:                        ║
+║            patient_id, summary, key_decisions, next_steps."                ║
+║                                                                            ║
+║  MCP TOOLS (restricted allowlist):                                         ║
+║    ┌──────────────────┐    ┌──────────────────────┐                       ║
+║    │ lookup_patient   │    │ fetch_case            │                       ║
+║    │ → HSA-katalog    │    │ → Ärendesystem API    │                       ║
+║    │   (staff + client│    │   (case history)      │                       ║
+║    │    registry)     │    │                        │                       ║
+║    └──────────────────┘    └──────────────────────┘                       ║
+║                                                                            ║
+║  KNOWLEDGE BASE: "Journalriktlinjer"                                      ║
+║    (RAG retrieves relevant sections about how to structure                 ║
+║     social service journal entries per Socialtjänstlagen ch. 11 §5)       ║
+║                                                                            ║
+║  OUTPUT (json):                                                            ║
+║  {                                                                         ║
+║    "patient_id": "P-198705-2341",                                         ║
+║    "case_number": "2026-BIS-0847",                                        ║
+║    "handler": "Anna Lindström",                                           ║
+║    "summary": "Klienten beskriver fortsatta svårigheter...",              ║
+║    "key_decisions": ["Utöka hemtjänst till 4x/vecka"],                    ║
+║    "next_steps": ["Uppföljning 2026-03-15"],                              ║
+║    "meeting_date": "2026-02-20"                                           ║
+║  }                                                                         ║
+║                                                                            ║
+║  ── Structured JSON flows forward to Step 3 ──                             ║
+║     Classification: K2 → K3 (escalation allowed)                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+                                    │
+                                    ▼
+╔════════════════════════════════════════════════════════════════════════════╗
+║  STEP 3: Skapa journalanteckning                                          ║
+║  Model:  KBWhisper (on-premise, sekretessdata)                            ║
+║  Klass:  3 (secret — full journal with personal details)                  ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║                                                                            ║
+║  INPUT:   all_previous_steps                                               ║
+║           ┌─────────────────────────────────────────────┐                 ║
+║           │ <step_1>                                     │                 ║
+║           │   Full transcript text...                    │                 ║
+║           │ </step_1>                                    │                 ║
+║           │ <step_2>                                     │                 ║
+║           │   {"patient_id":"P-198705-2341",...}         │                 ║
+║           │ </step_2>                                    │                 ║
+║           └─────────────────────────────────────────────┘                 ║
+║                                                                            ║
+║  PROMPT:  "Fyll i journalmallen. Använd                                    ║
+║            {{step_2.output.summary}} som sammanfattning.                   ║
+║            Handläggare: {{flow_input.handläggare}}.                        ║
+║            Patient: {{step_2.output.patient_id}}.                         ║
+║            Inkludera ordagrant citat från transkriberingen                  ║
+║            där klienten uttrycker sina behov."                              ║
+║                                                                            ║
+║  MCP TOOLS (restricted allowlist):                                         ║
+║    ┌──────────────────┐                                                    ║
+║    │ fill_template    │  ← fills a DOCX template with structured          ║
+║    │ → Mallsystem     │     data from the JSON + transcript               ║
+║    └──────────────────┘                                                    ║
+║                                                                            ║
+║  KNOWLEDGE BASE: "Journalmallar"                                          ║
+║    (RAG retrieves the correct template format for                          ║
+║     "Biståndshandläggning — Mötesanteckning")                              ║
+║                                                                            ║
+║  OUTPUT (docx):                                                            ║
+║    → journalanteckning_2026-BIS-0847.docx                                 ║
+║                                                                            ║
+║  OUTPUT MODE: http_post                                                    ║
+║    → POST https://journal.sundsvall.se/api/v1/entries                     ║
+║      Body: {"case": "{{step_2.output.case_number}}",                      ║
+║             "handler": "{{flow_input.handläggare}}",                       ║
+║             "document_id": "{{step_3.output.file_id}}"}                   ║
+║      Headers: {"Authorization": "Bearer sk_journal_xxx"}                  ║
+║                                                                            ║
+║  K3 data CANNOT flow backwards to K1 or K2 models                         ║
+║  K3 output CANNOT be sent to external webhooks                             ║
+║     (journal.sundsvall.se is internal → allowed)                          ║
+╚════════════════════════════════════════════════════════════════════════════╝
 ```
 
 After Step 3 completes, the generated DOCX is stored in Eneo (downloadable from the results tab) and simultaneously POSTed to the journal system. The user sees all three steps with green status indicators, execution times per step, and total token usage.
@@ -192,7 +191,7 @@ After Step 3 completes, the generated DOCX is stored in Eneo (downloadable from 
 
 ## Core Concepts
 
-### Eneo Flows (Floden)
+### Eneo Flows (Flöden)
 
 A flow is a sequential AI pipeline: **Start → Step 1 → Step 2 → Step 3 → End**. Each step is a full AI agent with its own prompt, model, knowledge base, and MCP (Model Context Protocol) tools. Steps execute one after another — no loops, no branching, no conditional logic.
 
@@ -200,7 +199,7 @@ This is deliberate. Municipal processes are inherently linear (receive → analy
 
 **What each step can do:**
 
-- Use a different AI model (Whisper for audio, GPT-4o for reasoning, Llama for on-premise)
+- Use a different AI model (KBWhisper for audio, GPT-4o for reasoning, on-premise models for classified data)
 - Access its own knowledge bases via RAG (Retrieval-Augmented Generation — the existing Eneo embedding pipeline is fully preserved)
 - Call external APIs via MCP tools (each step has an independent tool allowlist)
 - Read data from the original form input, the previous step, all previous steps, or an HTTP endpoint
@@ -298,8 +297,8 @@ Swedish municipal data is classified into three levels:
 
 ```mermaid
 graph LR
-    K1["K1\nWhisper (cloud)"] -->|"allowed"| K2["K2\nGPT-4o (EU)"]
-    K2 -->|"allowed"| K3["K3\nLlama (on-premise)"]
+    K1["K1\nKBWhisper (Berget/GDM)"] -->|"allowed"| K2["K2\nGPT-4o (EU)"]
+    K2 -->|"allowed"| K3["K3\nKBWhisper (on-premise)"]
     K3 -.->|"BLOCKED at save time"| K1
     K3 -.->|"BLOCKED"| K2
 
@@ -307,7 +306,7 @@ graph LR
     linkStyle 3 stroke:red,stroke-dasharray:5
 ```
 
-In the STT example: Whisper (K1) transcribes audio (not sensitive), GPT-4o (K2, EU-hosted) adds personal identifiers from the case system, Llama (K3, on-premise) produces the full journal entry with all personal data. Each step handles data at or above the classification of what it receives.
+In the STT example: KBWhisper via Berget/GDM (K1) transcribes audio (not sensitive), GPT-4o (K2, EU-hosted) adds personal identifiers from the case system, KBWhisper on-premise (K3) produces the full journal entry with all personal data. Each step handles data at or above the classification of what it receives.
 
 **MCP tool restriction per step:** Each step has a tool policy — either `inherit` (use all tools from the underlying assistant) or `restricted` (explicit allowlist only). Step 2 in the STT flow can call `lookup_patient` and `fetch_case`, but Step 3 cannot — even if the underlying assistant has those tools. Tools auto-execute within the pipeline; the allowed set is pre-configured by the flow administrator at design time.
 
@@ -318,45 +317,45 @@ In the STT example: Whisper (K1) transcribes audio (not sensitive), GPT-4o (K2, 
 The platform runs on three Docker networks with strict isolation:
 
 ```
-                    INTERNET
-                       │
-              ┌────────┴────────┐
-              │     TRAEFIK     │
-              │  (reverse proxy)│
-              └───┬─────────┬───┘
-                  │         │
-      ┌───────── │ ─────────│──────────────────────────────────┐
-      │  app_net │         │                                    │
-      │          ▼         │                                    │
-      │    ┌──────────┐    │    ┌──────────┐   ┌──────────┐   │
-      │    │ Frontend │    │    │  Worker  │   │ Backend  │   │
-      │    │ (Svelte) │    │    │  (ARQ)   │   │ (FastAPI)│   │
-      │    └──────────┘    │    └────┬─────┘   └──┬──┬────┘   │
-      │                    │         │            │  │         │
-      └────────────────────│─────────│────────────│──│─────────┘
-                           │         │            │  │
-      ┌────────────────────│─────────│────────────│──│─────────┐
-      │  data_net          │         │            │  │         │
-      │  (internal: true   │         ▼            ▼  │         │
-      │   — no egress)     │   ┌──────────┐  ┌──────────┐     │
-      │                    │   │ PostgreSQL│  │  Redis   │     │
-      │                    │   │ + pgvector│  │          │     │
-      │                    │   └──────────┘  └──────────┘     │
-      └────────────────────│───────────────────────────────────┘
-                           │                     │
-      ┌────────────────────│─────────────────────│─────────────┐
-      │  module_net        │                     │             │
-      │                    ▼                     ▼             │
-      │    ┌───────────────────┐  ┌───────────────────┐       │
-      │    │  Speech-to-Text  │  │     Widget Host    │       │
-      │    │  (BFF module)    │  │   (BFF module)     │       │
-      │    │                  │  │                     │       │
-      │    │  → backend:8000  │  │  → backend:8000    │       │
-      │    └───────────────────┘  └───────────────────┘       │
-      │                                                        │
-      │    Modules call backend internally.                    │
-      │    Modules CANNOT reach PostgreSQL or Redis.           │
-      └────────────────────────────────────────────────────────┘
+                        INTERNET
+                           │
+                  ┌────────┴────────┐
+                  │     TRAEFIK     │
+                  │  (reverse proxy)│
+                  └───┬─────────┬───┘
+                      │         │
+  ┌───────────────────│─────────│──────────────────────────────────────┐
+  │  app_net          │         │                                      │
+  │                   ▼         │                                      │
+  │    ┌──────────┐   │    ┌──────────┐    ┌──────────┐               │
+  │    │ Frontend │   │    │  Worker  │    │ Backend  │               │
+  │    │ (Svelte) │   │    │  (ARQ)   │    │ (FastAPI)│               │
+  │    └──────────┘   │    └────┬─────┘    └──┬──┬────┘               │
+  │                   │         │             │  │                     │
+  └───────────────────│─────────│─────────────│──│─────────────────────┘
+                      │         │             │  │
+  ┌───────────────────│─────────│─────────────│──│─────────────────────┐
+  │  data_net         │         │             │  │                     │
+  │  (internal: true  │         ▼             ▼  │                     │
+  │   — no egress)    │    ┌──────────┐  ┌──────────┐                 │
+  │                   │    │ PostgreSQL│  │  Redis   │                 │
+  │                   │    │ + pgvector│  │          │                 │
+  │                   │    └──────────┘  └──────────┘                 │
+  └───────────────────│────────────────────────────────────────────────┘
+                      │                      │
+  ┌───────────────────│──────────────────────│─────────────────────────┐
+  │  module_net       │                      │                         │
+  │                   ▼                      ▼                         │
+  │    ┌───────────────────┐  ┌───────────────────┐                   │
+  │    │  Speech-to-Text  │  │    Widget Host    │                   │
+  │    │  (BFF module)    │  │   (BFF module)    │                   │
+  │    │                  │  │                    │                   │
+  │    │  → backend:8000  │  │  → backend:8000   │                   │
+  │    └───────────────────┘  └───────────────────┘                   │
+  │                                                                    │
+  │    Modules call backend internally.                                │
+  │    Modules CANNOT reach PostgreSQL or Redis.                       │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 **app_net** — Frontend, Backend, Worker, and Traefik. Outbound internet access allowed (for LLM APIs, OIDC providers, external webhooks).
