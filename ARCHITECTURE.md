@@ -1,22 +1,25 @@
-# Eneo Platform Expansion — Definitive Architecture v3.2 (Final)
+# Eneo Platform Expansion — Definitive Architecture v3.9 (Final)
 
-**Date:** 2026-02-20
-**Status:** Final — 7 reviews consolidated (Claude, Codex, ChatGPT, Gemini ×4)
+**Date:** 2026-02-25
+**Status:** Final — v3.9 aligns auth/session lifecycle, module versioning, compose-first operations, and implementation guardrails
 **Scope:** Module system, Flöden (flows), widget, deployment, auth — single release
 
 ---
 
 ## Executive Summary
 
-Architecture for three capabilities: module system, sequential AI flows ("Flöden"), embeddable widget. Validated by 7 independent reviews converging on the same design.
+Architecture for three capabilities: module system, sequential AI flows ("Flöden"), embeddable widget. Validated by independent architectural reviews and aligned to municipal Docker Compose operations.
 
 **Key insights:**
 - API Key v2 eliminates custom widget auth (~500 LOC removed)
 - Inline Flow Builder creates hidden assistants behind the scenes (one-page UX)
 - Flow is its own DDD aggregate root (not nested inside Space)
 - Svelte Flow visualizer + JSON export for municipal compliance/transparency
+- Per-module image versioning enables independent module upgrades
+- Auth Broker token relay uses module-scoped JWTs (no custom user-id trust headers)
+- Docker Compose is primary deployment model for municipalities (K8s reference-only)
 
-**All phases merged.** PRs sequenced for reviewability, single version bump.
+**All phases merged.** PRs sequenced for reviewability, security, and operational clarity.
 
 ---
 
@@ -27,7 +30,7 @@ Architecture for three capabilities: module system, sequential AI flows ("Flöde
 | Pillar | Principle | Effect |
 |--------|-----------|--------|
 | **BFF Pattern** | Modules handle own routes, call backend internally | Core compose never changes |
-| **Auth Broker** | Backend is the only OIDC client | One login across subdomains |
+| **Auth Broker + Ticket Handoff** | Backend is the only OIDC client; modules exchange one-time tickets server-to-server | Module isolation preserved, no shared cookies |
 | **API Key v2** | `sk_` keys for service auth | Zero new auth infrastructure |
 
 ### The Flow Builder Philosophy
@@ -52,15 +55,15 @@ Every module is a server-rendered BFF. Browser never talks to backend on module 
 | `/health` endpoint | 200 OK when healthy |
 | `ENEO_BACKEND_URL` env | Server-side only |
 | Own `/api/*` routes | BFF: proxies to backend via module_net |
-| Delegates auth | SSO cookie or auth broker handoff |
+| Delegates auth | Auth broker ticket handoff (production) |
 | `module.json` manifest | id, name, version, port, health |
 
 ### 2.3 Subdomain Routing
 
 ```
 eneo.sundsvall.se           → Eneo UI + Backend
-taltilltext.sundsvall.se    → Speech-to-text module
-widget.sundsvall.se         → Widget host module
+taltilltext.eneo.sundsvall.se → Speech-to-text module
+widget.eneo.sundsvall.se      → Widget host module
 ```
 
 ### 2.4 Module Health Registry
@@ -71,20 +74,124 @@ Admin-registered (not auto-discovery). `module_registry` table. Background healt
 
 ## Part 3: Authentication
 
-### 3.1 User Auth
+### 3.1 User Auth — Auth Broker + Ticket Handoff (Production Default)
 
-SSO cookie on `.sundsvall.se`. Fallback: auth broker code exchange (CSRF-protected `state`).
+**No cross-subdomain shared auth cookie.** Modules do NOT inherit a session cookie from `.eneo.sundsvall.se`. The backend is the centralized OIDC client, and modules use ticket handoff + module-scoped JWT.
 
-### 3.2 Service Auth
+**Flow:**
+
+```
+Browser → module.eneo.sundsvall.se/login
+  → Module BFF creates random handoff_state and sets temporary __Host-handoff cookie
+  → 302 to eneo.sundsvall.se/api/v1/auth/module-initiate?module_client_id=speech-to-text&handoff_state=<nonce>&return_to=<path>
+    → Backend creates state_id and stores OIDC state payload in Redis (tenant_id, module_client_id, nonce, pkce_verifier, return_to), TTL 10 minutes
+    → 302 to IdP (OIDC login)
+    → IdP callback to /api/v1/auth/callback?state=<state_id>
+      → Backend GETDELs state payload from Redis (single use)
+      → Backend checks state payload:
+         IF module_client_id present:
+           → Mint one-time ticket (Redis, 10–30s TTL, atomic GETDEL consume)
+           → 302 to module callback_url?ticket=<ticket>&handoff_state=<nonce>
+         IF NO module_client_id (core web login):
+           → Return JSON { "access_token": "..." } (existing flow, unchanged)
+      → Module BFF receives ticket + handoff_state
+      → Module BFF verifies handoff_state matches __Host-handoff cookie
+      → Module BFF calls POST /api/v1/auth/ticket-exchange
+         with: { "ticket": "<ticket>" }
+         Authorization: Bearer sk_<module_service_key>
+      → Backend validates: ticket exists, not expired, not replayed,
+         module_client_id matches sk_ key's registered module
+      → Backend returns module-scoped JWT (sub=user_id, aud=module_client_id, scope, auth_time, iat, exp=15m)
+      → Module sets host-only __Host- cookie on its own domain
+```
+
+**Key security properties:**
+
+1. **Module-scoped session token:** The JWT returned by ticket-exchange is scoped to `module_client_id` + constrained permissions/audience. A compromised module session cannot be reused as a full core session.
+
+2. **One-time ticket controls:**
+   - TTL 10–30 seconds
+   - Atomic consume-once in Redis (`GETDEL`)
+   - Bound to `tenant_id` + `module_client_id`
+   - Reject replay and client mismatch
+
+3. **Module callback CSRF protection:** `handoff_state` MUST roundtrip through broker redirects and match temporary `__Host-handoff` cookie before ticket exchange.
+
+4. **Exchange endpoint protection:** `POST /api/v1/auth/ticket-exchange` requires the module's `sk_` service key in the Authorization header. The browser never directly exchanges tickets — only the module's BFF (server-side) does.
+
+5. **Leakage mitigation:**
+   - Callback responses include `Cache-Control: no-store`
+   - Callback page immediately clears query ticket via redirect
+   - Strict `Referrer-Policy: no-referrer` on callback routes
+
+6. **Open-redirect prevention:** Redirect targets must come from registered module client allowlist only (exact match, no wildcards).
+
+**Threat model:** If a module is fully compromised, the attacker obtains a module-scoped JWT that can only access endpoints allowed for that specific module. They cannot escalate to the core Eneo admin panel or access other modules' data.
+
+**Backwards compatibility:** The existing `/api/v1/auth/callback` JSON token flow for the core web app continues to work unchanged. The callback handler branches on whether `module_client_id` is present in the stored state payload.
+
+### 3.2 Auth Broker API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/v1/auth/module-initiate` | GET | Start module auth flow. Params: `module_client_id`, `return_to`, `handoff_state` |
+| `/api/v1/auth/ticket-exchange` | POST | Exchange one-time ticket for module-scoped JWT. Requires `sk_` key. |
+| `/api/v1/auth/module-refresh` | POST | Refresh module-scoped JWT. Requires `sk_` key + expiring module JWT. |
+| `/api/v1/auth/module-logout` | POST | Optional: revoke module session, clear module cookie |
+| `/api/v1/auth/callback` | GET | Existing OIDC callback — now branches: JSON (core) or 302+ticket (module) |
+
+### 3.3 Module Client Registration
+
+Each module must be registered in a `module_clients` configuration (table or JSONB per tenant):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `client_id` | str | Unique module identifier (e.g., `speech-to-text`) |
+| `callback_url` | str | Exact-match callback URL for redirect (e.g., `https://taltilltext.eneo.sundsvall.se/auth/callback`) |
+| `active` | bool | Whether this module client is enabled |
+| `allowed_scopes` | list | Optional: constrained permission set for module-scoped JWTs |
+| `module_api_contract` | str | Required API contract identifier (e.g., `core-api-v1`) |
+| `sk_key_id` | FK | Links to the module's `sk_` API key for exchange endpoint auth |
+
+### 3.4 Module-to-Backend Auth Patterns
 
 API Key v2 (`sk_` keys). Scoping, IP allowlists, rate limiting, audit, lifecycle.
 
 | Scenario | Mechanism |
 |----------|-----------|
-| User visits module | SSO cookie |
-| Module BFF for user | Forwards cookie/JWT |
-| Widget BFF (public) | `sk_` key from env |
+| User visits module | Auth broker ticket handoff → module-scoped JWT |
+| Module BFF → Backend (user context) | `Authorization: Bearer <module-scoped-jwt>` |
+| Module BFF → Backend (system context) | `Authorization: Bearer sk_<module_key>` |
+| Widget BFF (public) | `sk_` key from env (no user auth cookie) |
 | External API | `sk_`/`pk_` key |
+
+The backend never trusts custom user identity headers for authorization decisions. User identity is extracted from signed JWT claims (`sub`, `aud`, `tenant_id`, `scope`).
+
+### 3.5 Session Lifecycle
+
+- Module-scoped JWT TTL: 15 minutes
+- Refresh grace window: 5 minutes after `exp`
+- Absolute session timeout: 12 hours via immutable `auth_time`
+- Revocation watermark: backend enforces `iat > logout_after`
+- Refresh denial (expired absolute window, revoked user, suspended tenant) clears module cookie and forces re-authentication
+
+### 3.6 Security Hardening — Auth Broker
+
+| Control | Detail |
+|---------|--------|
+| OIDC state transport | Compact `state_id` in callback URL; state payload in Redis, TTL 10 minutes |
+| OIDC state consume | Redis `GETDEL` (single use) |
+| Callback CSRF | `handoff_state` must match `__Host-handoff` cookie before ticket exchange |
+| Ticket TTL | 10–30 seconds, configurable per deployment |
+| Ticket TTL start time | Starts when backend mints ticket in callback handler |
+| Ticket storage | Redis with atomic consume-once |
+| Ticket binding | `tenant_id` + `module_client_id` |
+| Exchange auth | Module `sk_` key required (server-to-server only) |
+| Token scoping | JWT `aud` = module_client_id, constrained permissions |
+| Redirect allowlist | Exact-match from `module_clients.callback_url` |
+| Cache headers | `Cache-Control: no-store` on all callback responses |
+| Referrer policy | `Referrer-Policy: no-referrer` on callback routes |
+| Core login compat | Existing `/api/v1/auth/callback` JSON flow unchanged |
 
 ---
 
@@ -96,7 +203,7 @@ API Key v2 (`sk_` keys). Scoping, IP allowlists, rate limiting, audit, lifecycle
 | `data_net` | Backend, Worker, DB, Redis | **Yes** | Isolated |
 | `module_net` | Traefik, Backend, Modules | No | Module ↔ Backend |
 
-Backend bridges all three. Modules CANNOT reach DB or Redis.
+Backend bridges all three. Modules CANNOT reach DB or Redis. In Docker Compose, modules share `module_net` and can probe each other's internal ports; auth-layer controls (`sk_` scoping + module JWT audience/scope enforcement) are the primary isolation boundary.
 
 ---
 
@@ -104,7 +211,12 @@ Backend bridges all three. Modules CANNOT reach DB or Redis.
 
 **Embedding:** `embed.js` → iframe. CSP `frame-ancestors`. Aggressive caching.
 
-**Rate limiting:** BFF per-IP (20/hr, in-memory LRU) + backend per-key (500/hr, Redis).
+**Security boundary:**
+- Primary: server-side `sk_` key (scoped permissions, rate-limited, audited, rotatable).
+- Secondary: CSP `frame-ancestors` allowlist + strict Origin/CORS checks in widget BFF.
+- Required: edge rate limiting (Traefik/Ingress) before requests hit widget runtime.
+
+**Rate limiting:** edge per-IP + backend per-key (Redis). In-memory per-process limiter remains fallback only.
 
 **Config:** Flow `metadata_json.widget_config` (V1). V2: `widget_configs` table.
 
@@ -317,9 +429,22 @@ This is what municipal auditors need when evaluating AI decision-making.
 
 ---
 
-## Part 7–9: Versioning, Compose, SDK (unchanged)
+## Part 7–9: Versioning, Compose, SDK
 
-Separate image per module, unified version. Core + modules overlay. `intric-js` directly.
+Separate image per module with independent tags:
+- Core services use `${ENEO_VERSION}`.
+- Module services use `${MODULE_<ID>_VERSION}`.
+
+Compatibility gate is contract-first:
+- Hard gate: `module_api_contract` match (e.g., `core-api-v1`).
+- Advisory metadata: `core_compat_min`/`core_compat_max`.
+- Optional audited admin override for exceptional municipal operations.
+
+Deployment posture:
+- Docker Compose is primary and fully supported for municipal environments (1–20+ modules).
+- Kubernetes/Helm is reference-only for organizations that already run K8s and need advanced HA/network-policy controls.
+
+SDK: `intric-js` directly.
 
 ---
 
@@ -355,7 +480,8 @@ eneo/
 |---|----------|--------|-----|
 | 1 | Module → Backend | **BFF** | Core never changes |
 | 2 | Networks | **3-tier** | Modules can't reach DB |
-| 3 | Service auth | **`sk_` API Key v2** | Already built |
+| 3 | Module user auth | **Auth Broker + Ticket Handoff** | Module isolation, no shared cookies, no IdP sprawl |
+| 3b | Service auth | **`sk_` API Key v2** | Already built |
 | 4 | Flow execution | **`execute_once()`** | Preserves RAG |
 | 5 | Flow DDD boundary | **Own aggregate root** | Avoids Space write latency |
 | 6 | Step definition | **Inline builder + hidden assistants** | One-page UX |
@@ -367,6 +493,13 @@ eneo/
 | 12 | Compliance | **Graph endpoint + Svelte Flow + JSON export** | Municipal transparency |
 | 13 | Webhook secrets | **Encrypted at rest (or documented plaintext V1)** | Enterprise security |
 | 14 | Entity cloning | **Check codebase: model_copy OR deepcopy** | Depends on MCP server type |
+| 15 | Module session cookie | **`__Host-` host-only cookie** | Minimize blast radius on module compromise |
+| 16 | OIDC state transport | **Redis-backed `state_id`** | Avoid IdP URL/state size issues |
+| 17 | Module JWT refresh | **Dedicated `/api/v1/auth/module-refresh`** | 15-minute TTL without redirect UX churn |
+| 18 | Module versioning | **Per-module `${MODULE_<ID>_VERSION}`** | Independent update path |
+| 19 | Compatibility gate | **`module_api_contract` primary** | Version-agnostic compatibility |
+| 20 | Flow resume determinism | **Execution-hash comparison** | Predictable reruns after logic changes |
+| 21 | Deployment target | **Compose-first (1–20+)** | Matches municipal operational reality |
 
 ### What NOT to Build
 
@@ -434,6 +567,9 @@ Container's SessionProxy pattern (`container.py:1367`) assumes request-scoped se
 | Step 1 empty input | P1-6: Validate step_order=1 cannot use `previous_step` |
 | File GC fails on ownership | P1-9: System-level GC path with tenant scope |
 | Space write latency from flows | Flow is own aggregate root |
+| Module compromise escalation | Module-scoped JWT with constrained aud + permissions |
+| Ticket replay attack | Atomic Redis consume-once, 10–30s TTL |
+| Open redirect via module callback | Exact-match allowlist from module_clients table |
 | Variable injection | JSON-safe escaping; variables only in prompt template |
 | Webhook header leak | Encrypted at rest or documented plaintext + admin-only |
 | Entity copy crash | `_safe_copy()` checks Pydantic vs domain entity |
@@ -446,8 +582,11 @@ Container's SessionProxy pattern (`container.py:1367`) assumes request-scoped se
 | Limitation | V1 | V2 Trigger |
 |------------|----|-----------| 
 | Widget config in flow metadata | Duplicate flow | 2 widgets same flow → `widget_configs` table |
-| BFF rate limiter per-replica | In-memory | 3+ K8s replicas → Ingress controller |
+| BFF rate limiter per-replica | Edge + backend limits required | Add distributed global limiter when needed |
 | Webhook headers plaintext | Admin-only + docs | Enterprise audit → Fernet encryption |
+| Module east-west on shared `module_net` | Accepted Compose trade-off; auth-layer isolation is primary | Strict east-west policies required |
+| No partial resume optimization | Upstream logic change forces full rerun from step 1 | Add earliest-changed-step partial rerun |
+| Independent module sessions | Module JWT revocation via TTL+refresh checks (`auth_time`, `logout_after`) | Full cross-domain single logout orchestration |
 | Simple variable interpolation | `{{var}}` regex | Need conditionals → template engine |
 | Svelte Flow read-only | Preview + export only | Need visual editor → evaluate builder mode |
 | No flow import | JSON export only | Need flow sharing → import endpoint |

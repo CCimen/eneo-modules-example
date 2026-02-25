@@ -1,4 +1,4 @@
-# Flöden Implementation Plan v3.2 (Final — All Reviews Consolidated)
+# Flöden Implementation Plan v3.9 (Final — All Reviews Consolidated)
 
 ## Context
 
@@ -156,6 +156,14 @@ flow_step_results
 ├── num_tokens_output: int | None
 ├── status: str (default "pending")             (pending | running | completed | failed)
 ├── error_message: str | None
+├── flow_step_execution_hash: str | None
+│     SHA256 over execution-critical fields only:
+│       assistant_id + prompt text + completion_model.id
+│       + mcp_policy + sorted(mcp_tool_allowlist when restricted)
+│       + input_source + canonical_json(input_config)
+│       + output_mode + output_type + canonical_json(output_config)
+│       + output_classification_override
+│     Excludes cosmetic fields (`user_description`, labels/icons, timestamps).
 └── tool_calls_metadata: JSONB | None
 │     ⚠️ VERIFY: Check tenant_model_adapter.py for non-streaming capture gap.
 │     Streaming path may populate this but non-streaming (our path) may not.
@@ -238,21 +246,19 @@ async def ask(self, ...,
     mcp_servers_override: list["MCPServer"] | None = None,
     prompt_override: str | None = None,
 ) -> tuple[ModelResponse, DatastoreResult]:
-    effective_instructions = (
+    effective_prompt = (
         prompt_override if prompt_override is not None
-        else self.instructions
+        else self.prompt
     )
     response = await self.completion_service.get_response(
         ...,
         mcp_servers=(mcp_servers_override if mcp_servers_override is not None
                      else self.mcp_servers),
-        instructions=effective_instructions,
+        prompt=effective_prompt,  # P0-3: matches completion_service API (prompt, not instructions)
     )
 ```
 
 **Why `prompt_override`:** `{{variables}}` in system prompt resolved at execution time. Original assistant entity never mutated.
-
-**Alternative if `completion_service` doesn't accept `instructions`:** Build resolved prompt and prepend to `question` parameter.
 
 ### Step B: `execute_once()` on `AssistantService`
 
@@ -351,6 +357,45 @@ def interpolate(text: str, context: dict, json_safe: bool = False) -> str:
 
 ---
 
+## Resume Determinism (Execution Hash)
+
+Use deterministic execution hashing so resume behavior only reacts to logic changes.
+
+```python
+def canonical_json(value) -> str:
+    return json.dumps(value or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def build_step_execution_hash(step) -> str:
+    restricted_tools = []
+    if step.mcp_policy == "restricted":
+        restricted_tools = sorted([str(tid) for tid in (step.mcp_tool_allowlist or [])])
+    payload = {
+        "assistant_id": str(step.assistant.id),
+        "prompt": step.assistant.prompt or "",
+        "completion_model_id": str(step.assistant.completion_model.id),
+        "mcp_policy": step.mcp_policy,
+        "mcp_tool_allowlist": restricted_tools,
+        "input_source": step.input_source,
+        "input_config": canonical_json(step.input_config),
+        "output_mode": step.output_mode,
+        "output_type": step.output_type,
+        "output_config": canonical_json(step.output_config),
+        "output_classification_override": step.output_classification_override,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+```
+
+**Resume rules:**
+- If any upstream step hash changed (or topology changed), force full rerun from Step 1.
+- If upstream hashes are unchanged, resume from the first failed step.
+
+**Examples:**
+- Cosmetic edit only (`user_description` typo fix): hash unchanged → no forced full rerun.
+- Execution change (`prompt`, model, `input_config`, or `output_mode`): hash changed → full rerun from Step 1.
+
+---
+
 ## SequentialFlowRunner (Manual DB Sessions)
 
 **CRITICAL:** The runner does NOT receive a database session from the worker. It creates short-lived sessions only when persisting results.
@@ -407,7 +452,7 @@ class SequentialFlowRunner:
                     raise FlowStepError(f"Step {step.step_order}: {token_count} tokens > {model_limit} limit")
 
                 # 3. Variable interpolation in system prompt
-                resolved_prompt = interpolate(step.assistant.instructions or "", context, json_safe=False)
+                resolved_prompt = interpolate(step.assistant.prompt or "", context, json_safe=False)
 
                 # 4. MCP tools
                 effective_mcp = self._resolve_step_mcp_tools(step)
@@ -859,4 +904,7 @@ Subscribe on run page. Per-step: ✅ completed, 🔄 running, ⏳ pending, ❌ f
 - tool_calls_metadata capture verified for non-streaming
 - Svelte Flow is read-only (no building/importing)
 - Graph endpoint computed from flow data (no separate table)
+- Auth Broker + Ticket Handoff is the production auth pattern for modules (see unified implementation plan v3.9)
+- Module-scoped JWTs used for flow execution on behalf of module users must carry `aud` = module_client_id
+- `prompt_override` (not `instructions_override`) used throughout — matches actual `completion_service.get_response(prompt=...)` API
 - All v3.1 assumptions apply

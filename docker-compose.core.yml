@@ -9,6 +9,8 @@
 #   module_net  — Modules ↔ Backend + Traefik. Modules call backend internally.
 #
 # Backend bridges all three networks.
+# Backend hosts Auth Broker endpoints (module-initiate, ticket-exchange, callback).
+# Modules use internal backend URL (http://eneo_backend:8000) for ticket exchange.
 # Modules CANNOT reach DB or Redis.
 #
 # Start:
@@ -105,15 +107,24 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=eneo_app_net"
-      # Backend API ONLY exposed on ENEO_DOMAIN — NEVER on module domains
-      - "traefik.http.routers.backend.rule=Host(`${ENEO_DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/openapi.json`) || PathPrefix(`/version`))"
+      # Backend API exposed on ENEO_DOMAIN. /docs and /openapi.json are gated separately.
+      - "traefik.http.routers.backend.rule=Host(`${ENEO_DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/version`))"
       - "traefik.http.routers.backend.entrypoints=web"
       - "traefik.http.routers.backend.middlewares=redirect-to-https"
-      - "traefik.http.routers.backend-s.rule=Host(`${ENEO_DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/openapi.json`) || PathPrefix(`/version`))"
+      - "traefik.http.routers.backend-s.rule=Host(`${ENEO_DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/version`))"
       - "traefik.http.routers.backend-s.entrypoints=websecure"
       - "traefik.http.routers.backend-s.tls.certresolver=letsencrypt"
       - "traefik.http.routers.backend-s.priority=10"
       - "traefik.http.routers.backend-s.middlewares=security-headers"
+      # Optional docs exposure. Set ENEO_DOCS_DOMAIN=${ENEO_DOMAIN} to enable.
+      - "traefik.http.routers.backend-docs.rule=Host(`${ENEO_DOCS_DOMAIN:-disabled.internal}`) && (PathPrefix(`/docs`) || PathPrefix(`/openapi.json`))"
+      - "traefik.http.routers.backend-docs.entrypoints=web"
+      - "traefik.http.routers.backend-docs.middlewares=redirect-to-https"
+      - "traefik.http.routers.backend-docs-s.rule=Host(`${ENEO_DOCS_DOMAIN:-disabled.internal}`) && (PathPrefix(`/docs`) || PathPrefix(`/openapi.json`))"
+      - "traefik.http.routers.backend-docs-s.entrypoints=websecure"
+      - "traefik.http.routers.backend-docs-s.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.backend-docs-s.priority=11"
+      - "traefik.http.routers.backend-docs-s.middlewares=security-headers"
       - "traefik.http.services.backend-svc.loadbalancer.server.port=8000"
 
   worker:

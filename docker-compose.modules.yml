@@ -2,11 +2,12 @@
 # ENEO MODULES — docker-compose.modules.yml (Definitive)
 # ============================================================================
 # Each module is a BFF: serves UI + proxies API calls to backend internally.
-# Adding a module ONLY requires changes to THIS file + .env + env_modules.env.
+# Adding a module ONLY requires changes to THIS file + .env + module env files.
 # docker-compose.core.yml NEVER changes.
 #
 # Auth model:
-#   User auth:    SSO cookie on .sundsvall.se (set by backend)
+#   User auth:    Auth Broker + Ticket Handoff (backend-centralized OIDC, one-time
+#                 ticket exchange, module-scoped JWT). No cross-subdomain shared cookies.
 #   Service auth: sk_ API key per module (created in Eneo admin UI)
 #
 # Usage:
@@ -14,20 +15,27 @@
 #                  --profile speech-to-text up -d
 # ============================================================================
 
+x-module-common: &module-common
+  restart: unless-stopped
+  networks:
+    - module_net
+  depends_on:
+    backend:
+      condition: service_healthy
+
 services:
 
   # --------------------------------------------------------------------------
   # Speech-to-text module
   # --------------------------------------------------------------------------
   # UI + BFF for the Tal-till-text sequential flow pipeline.
-  # Uses user's SSO cookie for authenticated requests.
-  # Uses STT_API_KEY (sk_ key) for service-level backend calls.
+  # Uses Auth Broker ticket handoff for user authentication.
+  # Uses STT_API_KEY (sk_ key) for service-level backend calls and ticket exchange.
   # --------------------------------------------------------------------------
   mod-speech-to-text:
+    <<: *module-common
     profiles: ["speech-to-text", "all-modules"]
-    image: ghcr.io/eneo-ai/eneo-mod-speech-to-text:${ENEO_VERSION:-latest}
-    container_name: eneo_mod_speech_to_text
-    restart: unless-stopped
+    image: ghcr.io/eneo-ai/eneo-mod-speech-to-text:${MODULE_STT_VERSION:-latest}
     environment:
       # Internal backend URL (server-side only, never exposed to browser)
       - ENEO_BACKEND_URL=http://eneo_backend:8000
@@ -36,14 +44,13 @@ services:
       # Public URL of this module (for auth return_to callbacks)
       - MODULE_PUBLIC_URL=https://${MODULE_TTT_DOMAIN}
       - MODULE_ID=speech-to-text
-      # Auth strategy: eneo_sso (shared cookie) or handoff (code exchange)
-      - MODULE_AUTH_STRATEGY=${MODULE_AUTH_STRATEGY:-eneo_sso}
-    env_file: env_modules.env
-    networks:
-      - module_net
-    depends_on:
-      backend:
-        condition: service_healthy
+      # Auth strategy: handoff (Auth Broker + Ticket Exchange, production default)
+      # eneo_sso is a local-dev-only fallback and should NOT be used in production.
+      - MODULE_AUTH_STRATEGY=${MODULE_AUTH_STRATEGY:-handoff}
+      # Session cookies in the module MUST be host-only (__Host- prefix, no Domain attr).
+    env_file:
+      - env_modules.env
+      - env_module_stt.env
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001/health"] # Ensure the docker image has wget installed or switch to node based fetch script instead.
       interval: 30s
@@ -77,21 +84,18 @@ services:
   #   - Rotatable with grace period (zero-downtime key rotation)
   # --------------------------------------------------------------------------
   mod-widget:
+    <<: *module-common
     profiles: ["widget", "all-modules"]
-    image: ghcr.io/eneo-ai/eneo-mod-widget:${ENEO_VERSION:-latest}
-    container_name: eneo_mod_widget
-    restart: unless-stopped
+    image: ghcr.io/eneo-ai/eneo-mod-widget:${MODULE_WIDGET_VERSION:-latest}
     environment:
       - ENEO_BACKEND_URL=http://eneo_backend:8000
       - ENEO_PUBLIC_URL=https://${ENEO_DOMAIN}
       - MODULE_PUBLIC_URL=https://${MODULE_WIDGET_DOMAIN}
       - MODULE_ID=widget
-    env_file: env_modules.env
-    networks:
-      - module_net
-    depends_on:
-      backend:
-        condition: service_healthy
+      # Widget auth is server-side sk_ key only; no shared wildcard session cookies.
+    env_file:
+      - env_modules.env
+      - env_module_widget.env
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3002/health"]
       interval: 30s
@@ -123,7 +127,7 @@ services:
   # 3. Add service entry below (copy speech-to-text pattern)
   # 4. Add MODULE_MYMOD_DOMAIN to .env
   # 5. Create sk_ API key in Eneo admin UI (scoped, IP-restricted)
-  # 6. Add MYMOD_API_KEY=sk_xxx to env_modules.env
+  # 6. Add module secrets to env_module_mymod.env (optionally shared defaults in env_modules.env)
   # 7. Add to CI build matrix
   # 8. Done. ZERO changes to docker-compose.core.yml.
   # --------------------------------------------------------------------------

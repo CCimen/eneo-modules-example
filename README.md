@@ -14,9 +14,9 @@ Det här repot innehåller arkitekturdokumenten för Eneos nya funktioner: Flöd
 
 | File | For whom | What it covers |
 |------|----------|----------------|
-| `eneo-definitive-architecture-v3.2.md` | Architects, tech leads | The full architecture: module system, network model, auth, widget, flows. Source of truth. |
-| `eneo-unified-implementation-plan-v3.2.md` | Developers, architects | Implementation spec: data models, API endpoints, worker tasks, frontend. 7-PR delivery plan. |
-| `flowdesign-v3.2(2).md` | Developers | Flow execution internals: variable resolution, classification validation, runner, SSRF. |
+| `ARCHITECTURE.md` | Architects, tech leads | The "Why" and the "Boundaries": module system, network model, auth broker theory, API Key v2 strategy, high-level system components. |
+| `IMPLEMENTATION.md` | Developers, architects | The "What" and the "When": database schema, API endpoint signatures, auth broker endpoints, frontend requirements, 7-PR delivery sequence. |
+| `FLOW_EXECUTION_ENGINE.md` | Backend developers | The "How": SequentialFlowRunner internals, variable interpolation, short-lived DB transactions, SSRF protection, RAG context preservation. |
 | `docker-compose.core.yml` | DevOps, architects | Core infrastructure: Traefik, Frontend, Backend, Worker, PostgreSQL, Redis. Three-network isolation. |
 | `docker-compose.modules.yml` | DevOps, developers | Module overlay: how to add Speech-to-Text, Widget, or any new module. Zero changes to core. |
 | `taltilltextflow.excalidraw.png` | Everyone | Visual diagram of the Speech-to-Text flow pipeline. |
@@ -66,7 +66,7 @@ The module handles the user experience. The backend handles execution, security,
 
 A social worker in Sundsvall finishes a client meeting about welfare support. They recorded the audio. Today, turning that recording into a formal journal entry takes 45 minutes of manual work: transcribe, look up patient data, cross-reference guidelines, write the entry, post it to the journal system.
 
-With an Eneo flow, it takes one button press. The user visits `taltilltext.sundsvall.se` (the STT module), uploads the audio, fills in case number and handler name, and hits "Kör flödet." Three AI steps execute in sequence:
+With an Eneo flow, it takes one button press. The user visits `taltilltext.eneo.sundsvall.se` (the STT module), uploads the audio, fills in case number and handler name, and hits "Kör flödet." Three AI steps execute in sequence:
 
 ![Speech-to-Text Flow Architecture](./taltilltextflow.excalidraw.png)
 
@@ -211,7 +211,7 @@ This is deliberate. Municipal processes are inherently linear (receive → analy
 
 **Variable interpolation** connects the steps. A prompt can reference `{{flow_input.field_name}}` for form data or `{{step_2.output.summary}}` for a JSON field from a previous step's output. Variables are JSON-safe escaped to prevent injection in HTTP request bodies.
 
-Deep dive: [eneo-unified-implementation-plan-v3.2.md](./eneo-unified-implementation-plan-v3.2.md)
+Deep dive: [IMPLEMENTATION.md](./IMPLEMENTATION.md)
 
 ---
 
@@ -228,7 +228,7 @@ Without modules, every new capability (STT, document scanning, form builder, etc
 ```mermaid
 flowchart TB
     Browser["`Browser
-taltilltext.sundsvall.se`"]
+taltilltext.eneo.sundsvall.se`"]
 
     subgraph Module["STT Module Container"]
         ModUI["`Module UI
@@ -255,7 +255,7 @@ eneo_backend:8000`"]
 
 Each module is a standalone server that:
 
-1. **Serves its own UI** at its own subdomain (e.g., `taltilltext.sundsvall.se`)
+1. **Serves its own UI** at its own subdomain (e.g., `taltilltext.eneo.sundsvall.se`)
 2. **Has its own `/api/*` routes** that proxy requests to the Eneo backend internally
 3. **Runs in its own container** on the module network
 4. **Cannot reach the database or Redis** — it can only talk to the backend API
@@ -283,11 +283,65 @@ The browser never communicates directly with the Eneo backend when on a module's
 
 **Authentication for modules:**
 
-- **User-facing modules** (like STT): use the SSO (Single Sign-On) cookie from `.sundsvall.se`. The user is already logged into Eneo — the module inherits the session.
-- **Service-level calls**: use `sk_` API keys (API Key v2) — scoped to specific spaces, IP-restricted to the Docker module network, rate-limited, audited per request, and rotatable with a grace period for zero-downtime rotation.
-- **Widget module** (for embedding on external sites): uses only `sk_` keys since anonymous visitors don't have Eneo accounts.
+- **User-facing modules** (like STT): use **Auth Broker + Ticket Handoff**. The module BFF sets a temporary `__Host-handoff` state cookie before redirecting to `/api/v1/auth/module-initiate`, and validates the returned `handoff_state` before calling `ticket-exchange` (prevents callback/login CSRF).
+- **User-context backend calls**: module BFF sends `Authorization: Bearer <module-scoped-jwt>`. Backend extracts `sub/aud/tenant_id/scope` from signed JWT claims (no custom user-id trust header).
+- **System-context backend calls**: module BFF sends `Authorization: Bearer sk_<module_key>` (ticket exchange, health, anonymous widget operations).
+- **Widget module** (public embed): primary security boundary is server-side `sk_` key scoping. CSP `frame-ancestors`, strict Origin/CORS checks, and edge rate limits are defense-in-depth.
 
-Deep dive: [eneo-definitive-architecture-v3.2.md](./eneo-definitive-architecture-v3.2.md)
+**Deployment posture:**
+
+- **Docker Compose is the primary and fully supported model** for municipal environments (1–20+ modules).
+- **Kubernetes is reference-only** for organizations that already run K8s and need advanced features (NetworkPolicies, rolling HA, multi-node orchestration).
+
+### Why Two Safeguards Exist (Determinism + Compatibility)
+
+This section explains the intent in plain language. If you need implementation details, use the direct links under each safeguard.
+
+#### `flow_step_execution_hash` (resume determinism)
+
+**Problem:** A flow fails on step 3, an editor changes prompts in step 1 and step 3, then clicks resume. If the system resumes from step 3 using old cached output from step 1, the run mixes old/new logic and becomes non-deterministic.
+
+**Solution:** Each completed step stores `flow_step_execution_hash` from execution-critical fields only. On resume, backend compares upstream stored hashes against current definitions.
+
+- If upstream logic or topology changed: rerun from step 1.
+- If upstream logic is unchanged: resume from first failed step.
+
+**Hashed (affects execution):** `assistant_id`, prompt text, `completion_model.id`, `mcp_policy`, restricted `mcp_tool_allowlist`, `input_source`, `input_config`, `output_mode`, `output_type`, `output_config`, `output_classification_override`.
+
+**Not hashed (cosmetic):** `user_description`, icons, timestamps, UI-only rendering hints.
+
+This prevents "Frankenstein runs" while avoiding unnecessary reruns from label/typo-only edits.
+
+**Read more:**
+- Hash semantics and resume rules: [FLOW_EXECUTION_ENGINE.md — Resume Determinism (Execution Hash)](./FLOW_EXECUTION_ENGINE.md#resume-determinism-execution-hash)
+- API contract and acceptance checks: [IMPLEMENTATION.md — 13.4 Module JWT Claims, Auth Patterns, and Refresh](./IMPLEMENTATION.md#134-module-jwt-claims-auth-patterns-and-refresh)
+- Architectural decision record: [ARCHITECTURE.md — Part 11: Decision Matrix](./ARCHITECTURE.md#part-11-decision-matrix)
+
+#### `module_registry` extension fields (operator predictability)
+
+`module_registry` now tracks compatibility metadata so operators can safely update one module without guessing cross-impact.
+
+| Column | Purpose |
+|------|---------|
+| `module_version` | Shows what module version is actually running |
+| `image_digest` | Pins exact deployed image (not only tag) |
+| `module_api_contract` | Primary compatibility gate against core API contract |
+| `core_compat_min` / `core_compat_max` | Advisory tested core-version range |
+| `compat_status` | Computed status shown to operators (`compatible` / `incompatible` / `unknown`) |
+| `release_notes_url` | Direct link to upgrade-change details |
+
+**Operational flow:** module reports metadata via health/reconciliation, backend computes `compat_status`, admin sees exact compatibility reason before enabling/upgrading.
+
+**Read more:**
+- Compatibility and versioning model: [ARCHITECTURE.md — Part 7–9: Versioning, Compose, SDK](./ARCHITECTURE.md#part-79-versioning-compose-sdk)
+- Data model fields and PR placement: [IMPLEMENTATION.md — 1.3 Module Registry Table](./IMPLEMENTATION.md#13-module-registry-table)
+- Known operational boundaries: [ARCHITECTURE.md — Part 14: Known Limitations & V2 Boundaries](./ARCHITECTURE.md#part-14-known-limitations--v2-boundaries)
+
+### Where to Go Next
+
+- High-level architecture: [ARCHITECTURE.md](./ARCHITECTURE.md)
+- Delivery/PR sequence and endpoint contracts: [IMPLEMENTATION.md](./IMPLEMENTATION.md)
+- Flow engine behavior and hashing internals: [FLOW_EXECUTION_ENGINE.md](./FLOW_EXECUTION_ENGINE.md)
 
 ---
 
@@ -372,7 +426,7 @@ The platform runs on three Docker networks with strict isolation:
 
 **data_net** — PostgreSQL (with pgvector) and Redis only. Marked `internal: true` in Docker — no outbound internet, no routing to other networks. Only Backend and Worker are connected here. Modules, Frontend, and Traefik cannot reach the database.
 
-**module_net** — Modules and Traefik. Each module can reach the Backend at `http://eneo_backend:8000`. Modules are isolated from each other and from the data layer.
+**module_net** — Modules and Traefik. Each module can reach the Backend at `http://eneo_backend:8000`. In Docker Compose, modules share this network and can probe each other's internal ports; the real isolation boundary is auth (`sk_` scoping + module-scoped JWT `aud/scope`). Modules remain isolated from the data layer.
 
 The Backend is the only service that bridges all three networks — the single gateway between the outside world, the data layer, and the modules. Even if a module container is compromised, the attacker has no path to the database.
 
@@ -386,7 +440,7 @@ The Speech-to-Text module is not the flow itself. It is a specialized UI wrapper
 
 ```
  ┌────────────────────────────────────────────────────────────────┐
- │  Browser (taltilltext.sundsvall.se)                            │
+ │  Browser (taltilltext.eneo.sundsvall.se)                            │
  └──────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
@@ -418,11 +472,11 @@ This separation is the core value of the module architecture: **the flow engine 
 
 ## Further Reading
 
-- **[eneo-definitive-architecture-v3.2.md](./eneo-definitive-architecture-v3.2.md)** — The source of truth. Full module system, auth model, network architecture, widget embedding, flow engine, and all 14 key architectural decisions.
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — The "Why" and the "Boundaries". Module system, auth broker theory, network architecture, widget embedding, flow engine, and all key architectural decisions.
 
-- **[eneo-unified-implementation-plan-v3.2.md](./eneo-unified-implementation-plan-v3.2.md)** — Implementation spec. Data models, API endpoints, worker tasks, frontend components, and the 7-PR delivery sequence.
+- **[IMPLEMENTATION.md](./IMPLEMENTATION.md)** — The "What" and the "When". Database schema, API endpoints, auth broker implementation, worker tasks, frontend components, and the 7-PR delivery sequence.
 
-- **[flowdesign-v3.2(2).md](./flowdesign-v3.2(2).md)** — Flow execution internals. Variable resolution, classification validation, SequentialFlowRunner, SSRF protection, and codebase alignment fixes.
+- **[FLOW_EXECUTION_ENGINE.md](./FLOW_EXECUTION_ENGINE.md)** — The "How". Variable resolution, classification validation, SequentialFlowRunner, SSRF protection, short-lived DB transactions, and codebase alignment fixes.
 
 - **[docker-compose.core.yml](./docker-compose.core.yml)** — Core infrastructure. Defines the three-network model and all core services. This file never changes when adding modules.
 

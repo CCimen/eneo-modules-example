@@ -1,8 +1,8 @@
-# Eneo Unified Implementation Plan v3.2 — Final
+# Eneo Unified Implementation Plan v3.9 — Final
 
-**Date:** 2026-02-20
-**Status:** Final — 7 reviews, all phases merged, Codex/Gemini fixes applied
-**Scope:** Flöden + Modules + Widget + Health Registry — single release, 7 PRs
+**Date:** 2026-02-25
+**Status:** Final — v3.9 aligns broker handoff, refresh lifecycle, deterministic resume semantics, and compose-first operations
+**Scope:** Flöden + Modules + Widget + Health Registry + Auth Broker — single release, 7 PRs
 
 ---
 
@@ -153,6 +153,14 @@ flow_step_results
 ├── num_tokens_output: int | None
 ├── status: str (default "pending")
 ├── error_message: str | None
+├── flow_step_execution_hash: str | None
+│     SHA256 over execution-critical fields only:
+│       assistant_id + prompt text + completion_model.id
+│       + mcp_policy + sorted(mcp_tool_allowlist when restricted)
+│       + input_source + canonical_json(input_config)
+│       + output_mode + output_type + canonical_json(output_config)
+│       + output_classification_override
+│     Excludes cosmetic fields (`user_description`, labels/icons, timestamps).
 └── tool_calls_metadata: JSONB | None
 │     ⚠️ CODEBASE NOTE: Verify that tool_calls_metadata is populated for
 │     non-streaming calls in tenant_model_adapter.py. There may be a gap
@@ -169,6 +177,13 @@ module_registry
 ├── last_health_check_at: datetime | None
 ├── last_health_status: str (healthy | unhealthy | unknown)
 ├── enabled: bool (default True)
+├── module_version: str | None
+├── image_digest: str | None
+├── module_api_contract: str | None
+├── core_compat_min: str | None
+├── core_compat_max: str | None
+├── compat_status: str | None                 (compatible | incompatible | unknown)
+├── release_notes_url: str | None
 ├── tenant_id → tenants.id, metadata_json: JSONB | None
 ```
 
@@ -387,7 +402,7 @@ class SequentialFlowRunner:
 
                 # ── 3. Variable interpolation in system prompt ──
                 resolved_prompt = interpolate(
-                    step.assistant.instructions or "", context, json_safe=False)
+                    step.assistant.prompt or "", context, json_safe=False)
 
                 # ── 4. MCP tools ──
                 effective_mcp = self._resolve_step_mcp_tools(step)
@@ -481,7 +496,7 @@ def _safe_copy(obj):
         return copy.deepcopy(obj)
 ```
 
-### Input Resolution (abbreviated — full logic in flowdesign-v3.2.md)
+### Input Resolution (abbreviated — full logic in FLOW_EXECUTION_ENGINE.md)
 
 Handles: `flow_input`, `previous_step`, `all_previous_steps`, `http_get`, `http_post`.
 `http_post` input: body interpolated with `json_safe=True`.
@@ -613,7 +628,149 @@ async def run_flow(params: FlowRunParams, container, worker_config):
 
 ---
 
-## 11-13: Module Template, Widget, Auth Broker (unchanged from v3.1)
+## 11: Module Template (unchanged from v3.1)
+
+---
+
+## 12: Widget (unchanged from v3.1)
+
+---
+
+## 13: Auth Broker + Ticket Handoff (v3.9)
+
+**Production default:** Auth Broker with one-time ticket exchange. No wildcard shared cookie domain.
+
+### 13.1 Auth Broker Endpoints
+
+| Endpoint | Method | Auth | Purpose |
+|----------|--------|------|---------|
+| `/api/v1/auth/module-initiate` | GET | None (browser redirect) | Start module auth. Params: `module_client_id`, `return_to`, `handoff_state`. Backend stores state in Redis and sends compact `state_id` to IdP. |
+| `/api/v1/auth/callback` | GET | OIDC callback | **Conditional branch:** if state payload contains `module_client_id` → mint one-time ticket and redirect to module callback (`ticket` + `handoff_state`). If not → return JSON `{ "access_token": "..." }` for core login flow (unchanged). |
+| `/api/v1/auth/ticket-exchange` | POST | `Authorization: Bearer sk_<module_key>` | Exchange one-time ticket for module-scoped JWT. Body: `{ "ticket": "<ticket>" }`. |
+| `/api/v1/auth/module-refresh` | POST | `Authorization: Bearer sk_<module_key>` | Refresh expiring module-scoped JWT. Body: `{ "token": "<module_jwt>" }`. |
+| `/api/v1/auth/module-logout` | POST | Module-scoped JWT | Revoke module session, clear module cookie, and update revocation watermark. |
+
+### 13.2 Module Client Configuration
+
+`module_clients` table (V1 managed via seed/sysadmin API; no end-user admin UI in this release):
+
+```
+module_clients
+├── id, created_at, updated_at
+├── tenant_id → tenants.id (CASCADE)
+├── client_id: str (unique per tenant)          e.g., "speech-to-text"
+├── callback_url: str                           Exact-match only. e.g., "https://taltilltext.eneo.sundsvall.se/auth/callback"
+├── active: bool (default True)
+├── allowed_scopes: JSONB | None                Optional permission constraints for module-scoped JWTs
+├── module_api_contract: str                    e.g., "core-api-v1"
+└── sk_key_id → api_keys.id (SET NULL)          Links to the module's sk_ key for exchange/refresh auth
+```
+
+### 13.3 OIDC State + Ticket Lifecycle (Redis)
+
+```python
+# module-initiate
+state_id = secrets.token_urlsafe(24)
+state_payload = {
+    "tenant_id": str(tenant.id),
+    "module_client_id": module_client_id,
+    "handoff_state": handoff_state,
+    "return_to": return_to,
+    "nonce": nonce,
+    "pkce_verifier": pkce_verifier,
+}
+await redis.set(f"oidc_state:{state_id}", json.dumps(state_payload), ex=600)  # 10m TTL
+
+# callback
+state_json = await redis.getdel(f"oidc_state:{state_id}")  # single use
+if not state_json:
+    raise HTTPException(401, "Invalid or expired state")
+
+# ticket mint
+ticket = secrets.token_urlsafe(32)
+await redis.set(f"module_ticket:{ticket}", json.dumps(ticket_payload), ex=30)  # 10-30s TTL
+
+# ticket exchange
+ticket_json = await redis.getdel(f"module_ticket:{ticket}")  # single use
+if not ticket_json:
+    raise HTTPException(401, "Ticket expired or already consumed")
+```
+
+### 13.4 Module JWT Claims, Auth Patterns, and Refresh
+
+**Module-scoped JWT claims:** `sub`, `tenant_id`, `aud`, `scope`, `auth_time`, `iat`, `exp`, `jti`.
+
+**Backend call patterns (explicit):**
+- **User-context calls (module BFF acting for logged-in user):** `Authorization: Bearer <module-scoped-jwt>`
+- **System-context calls (ticket-exchange, refresh, health, anonymous widget):** `Authorization: Bearer sk_<module_key>`
+
+Backend authorization logic must not trust custom user-id headers; identity comes from signed JWT claims.
+
+**Refresh contract (`/api/v1/auth/module-refresh`):**
+- Validate JWT signature and issuer.
+- Validate module key binding: `sk_` key must map to JWT `aud`.
+- Validate grace window: `now < exp + MODULE_REFRESH_GRACE_SECONDS`.
+- Validate absolute session: `now - auth_time < MODULE_MAX_SESSION_HOURS`.
+- Validate revocation watermark: `iat > logout_after`.
+- Validate user/tenant still active.
+- Return fresh 15-minute JWT preserving original `auth_time`.
+- On failure: module BFF clears cookie and redirects to login.
+
+**Backend implementation note (decode trap):** `module-refresh` receives tokens that may have just expired. Do not use strict `get_current_user` dependency for this path. Decode with signature validation and manual expiry enforcement (`verify_exp=False` or equivalent), then apply grace-window and absolute-timeout checks explicitly.
+
+### 13.5 Security Controls
+
+| Control | Implementation |
+|---------|---------------|
+| OIDC state transport | Compact `state_id` in URL; full state payload in Redis (10m TTL) |
+| OIDC state consume | Atomic `GETDEL` in Redis (single use) |
+| Callback CSRF | Module BFF verifies `handoff_state` against temporary `__Host-handoff` cookie |
+| Ticket TTL | 10–30 seconds (starts when backend mints ticket) |
+| Ticket consume | Atomic `GETDEL` in Redis |
+| Ticket binding | `tenant_id` + `module_client_id` verified on exchange |
+| Exchange/refresh auth | Module `sk_` key required in Authorization header |
+| JWT audience | `aud` = `module_client_id`, enforced by backend middleware |
+| Redirect allowlist | Exact-match from `module_clients.callback_url` (no wildcards) |
+| Cache headers | `Cache-Control: no-store` on callback responses |
+| Referrer policy | `Referrer-Policy: no-referrer` on callback routes |
+| Open redirect | Reject any `return_to` not matching registered callback URL |
+
+### 13.6 Backwards Compatibility
+
+Core web login flow remains unchanged:
+- Callback checks stored state payload for `module_client_id`
+- If absent → existing JSON token response for core frontend
+- If present → module ticket redirect path
+
+### 13.7 Acceptance Criteria
+
+- [ ] Module login succeeds via broker handoff (`handoff_state` validated)
+- [ ] Ticket replay fails (consumed on first exchange)
+- [ ] Ticket exchange with wrong `module_client_id` fails (403)
+- [ ] Expired ticket fails (after TTL)
+- [ ] OIDC state replay fails (state consumed on first callback)
+- [ ] Module-scoped JWT cannot access core-only endpoints
+- [ ] Refresh works within grace + absolute timeout windows
+- [ ] Refresh fails after `auth_time` absolute timeout
+- [ ] Refresh and API calls fail after `logout_after` revocation
+- [ ] Core web login remains unchanged and functional
+
+### 13.8 Migration from Legacy Shared Cookie
+
+If any environment previously used `SESSION_COOKIE_DOMAIN` on `.eneo.sundsvall.se`:
+1. Deploy broker endpoints alongside existing cookie auth
+2. Set `MODULE_AUTH_STRATEGY=handoff` on all module containers
+3. Remove `SESSION_COOKIE_DOMAIN` from backend config
+4. Verify module logins work via broker
+5. Remove any `eneo_sso` cookie references from module code
+
+### 13.9 Implementation Gotchas
+
+**1. Scrub `.env` files:** Remove `SESSION_COOKIE_DOMAIN=.eneo.sundsvall.se` from `.env`, `.env.example`, and templates.
+
+**2. Callback URL cleanup:** Module callback route must clear `ticket` from URL via second redirect after successful exchange.
+
+**3. `module_clients` management path:** Use DB seed/sysadmin API in V1. Do not build end-user admin CRUD in this release.
 
 ---
 
@@ -757,6 +914,7 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 ### PR 2: Flow APIs + Execution Engine
 - Routers/models/assemblers + API Key v2 wiring
 - **Graph endpoint** (`GET /flows/{id}/graph`)
+- **Resume endpoint** (`POST /flow-runs/{id}/resume`) with deterministic execution-hash checks
 - `execute_once()` + `mcp_servers_override` + `prompt_override`
 - `_safe_copy()` for MCP entity cloning
 - SequentialFlowRunner with: **manual session factory**, variable resolver (with JSON-safe escaping), idempotent steps, token pre-check
@@ -779,14 +937,26 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - API Key dialog: Flöden card
 - Translations
 
-### PR 5: Module Infrastructure
-- Template, auth helpers, health registry, compose overlay
+### PR 5: Module Infrastructure + Auth Broker
+- Template, health registry, compose overlay
+- **Auth Broker endpoints:** `module-initiate`, `ticket-exchange`, `module-refresh`, `module-logout`
+- **Callback branching:** conditional JSON (core) / 302+ticket (module) in `/api/v1/auth/callback`
+- **OIDC state transport:** Redis-backed `state_id` + single-use `GETDEL`
+- **Module callback CSRF:** `handoff_state` cookie roundtrip verification in module template
+- **Module client registration:** `module_clients` table + seed/sysadmin API path (no end-user admin CRUD in V1)
+- **Compatibility gate:** contract-first check on `module_api_contract`; advisory core version bounds
+- **One-time ticket:** Redis storage with atomic consume, TTL, client binding
+- **Module-scoped JWT:** `aud` claim, constrained permissions, backend middleware enforcement
+- **Session lifecycle:** 15m token TTL + refresh grace + `auth_time` absolute timeout + `logout_after` revocation
+- **Security headers:** `Cache-Control: no-store`, `Referrer-Policy: no-referrer` on callbacks
+- **Redirect allowlist:** exact-match validation from `module_clients.callback_url`
 
 ### PR 6: STT + Widget Modules
 - Both modules, Dockerfiles, e2e test
 
 ### PR 7: Hardening + Document Generation
 - Retention, file GC, DocumentGeneratorService
+- Compatibility override endpoint with full audit trail
 - tool_calls_metadata verification for non-streaming
 - Tests, docs, CHANGELOG
 
@@ -814,6 +984,26 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - [ ] JSON export downloads complete flow definition
 - [ ] PNG/SVG export captures diagram
 
+### Resume Determinism
+- [ ] `flow_step_execution_hash` computed from execution-critical fields only
+- [ ] Cosmetic edits (`user_description`, labels, timestamps) do NOT force full rerun
+- [ ] Upstream logic change forces full rerun from step 1
+- [ ] No upstream change resumes from first failed step
+
+### Auth Broker
+- [ ] Module login succeeds via broker ticket handoff (`handoff_state` verified)
+- [ ] OIDC state replay fails (`state_id` consumed once via `GETDEL`)
+- [ ] Ticket replay fails (consumed on first exchange)
+- [ ] Ticket exchange with wrong module_client_id fails
+- [ ] Expired ticket rejected
+- [ ] Redirect to unregistered callback URL rejected
+- [ ] Module-scoped JWT cannot access core-only endpoints
+- [ ] Refresh succeeds within grace window and absolute timeout
+- [ ] Refresh fails after absolute timeout (`auth_time`)
+- [ ] Refresh fails when `iat <= logout_after`
+- [ ] Core web login unchanged and functional
+- [ ] Logout clears module-local cookie only
+
 ### (All v3.1 checks also apply — inline builder, form schema, variables, I/O types, security, widget, modules)
 
 ---
@@ -827,4 +1017,9 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - tool_calls_metadata capture verified for non-streaming path
 - Svelte Flow is read-only visualization (no flow building/importing)
 - Graph endpoint is lightweight (no separate table, computed from flow data)
+- Auth Broker + Ticket Handoff is the production default (no shared cookie)
+- Redis is available for ticket storage and atomic consume-once
+- No IdP per-module redirect URI registration required (broker centralizes this)
+- Module-scoped JWT prevents blast-radius escalation from compromised modules
+- Docker Compose is the primary deployment model for municipal operations
 - All v3.1 assumptions also apply
