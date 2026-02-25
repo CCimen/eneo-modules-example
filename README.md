@@ -234,40 +234,46 @@ flowchart TB
     Browser["`Browser
 taltilltext.eneo.sundsvall.se`"]
 
-    subgraph Module["STT Module Container (module_net only)"]
-        ModUI["`Module UI
-(audio recorder, progress view)`"]
+    subgraph AppNet["app_net (Core Eneo)"]
+        Traefik["`Traefik
+(reverse proxy)`"]
+        Frontend["`Frontend
+(SvelteKit)`"]
+        Worker["`Worker
+(ARQ)`"]
+    end
+
+    subgraph ModuleNet["module_net (Isolated BFFs)"]
+        ModUI["`STT Module UI
+(audio recorder, progress)`"]
         ModAPI["`Module /api/* routes
 (BFF proxy layer)`"]
     end
 
-    Traefik["`Traefik
-(app_net + module_net)`"]
-
     Backend["`Backend API — eneo_backend:8000
-(app_net + data_net + module_net)`"]
+(bridges all 3 networks)`"]
 
-    Worker["`Worker — ARQ
-(app_net + data_net)`"]
-
-    subgraph data["data_net (internal: true — no egress)"]
-        DB["PostgreSQL + pgvector"]
-        Redis["Redis"]
+    subgraph DataNet["data_net (internal: true — no egress)"]
+        DB[("PostgreSQL + pgvector")]
+        Redis[("Redis")]
     end
 
     Browser -->|"HTTPS"| Traefik
     Traefik -->|"module_net"| ModUI
+    Traefik --> Frontend
     ModUI --> ModAPI
     ModAPI -->|"module_net"| Backend
+    Frontend --> Backend
     Backend -.->|"data_net"| DB
     Backend -.->|"data_net"| Redis
     Worker -.->|"data_net"| DB
     Worker -.->|"data_net"| Redis
-    ModAPI -.->|"BLOCKED — no network path"| DB
+    ModAPI -.->|"BLOCKED"| DB
 
-    style DB fill:#f9f,stroke:#333
-    style Redis fill:#f9f,stroke:#333
-    linkStyle 8 stroke:red,stroke-dasharray:5
+    style DataNet fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style ModuleNet fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style AppNet fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    linkStyle 10 stroke:red,stroke-dasharray:5
 ```
 
 Each module is a standalone server that:
@@ -311,27 +317,34 @@ The browser never communicates directly with the Eneo backend when on a module's
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant B as Browser
     participant M as Module BFF
     participant BE as Backend
     participant R as Redis
     participant IdP as Identity Provider
 
+    rect rgb(240, 248, 255)
+    Note over B, BE: Phase 1 — Initiation & Handoff State
     B->>M: GET /login
     M->>M: Generate handoff_state nonce
     M->>B: Set __Host-handoff cookie + 302
-
     B->>BE: GET /api/v1/auth/module-initiate<br/>?module_client_id=...&handoff_state=...
     BE->>R: Store OIDC state payload<br/>(state_id key, 10 min TTL)
     BE-->>B: 302 → IdP authorize URL
+    end
 
+    rect rgb(255, 250, 240)
+    Note over B, IdP: Phase 2 — OIDC Dance
     B->>IdP: Follow redirect, OIDC login
     IdP-->>B: 302 → /api/v1/auth/callback?code=...&state=state_id
     B->>BE: GET /api/v1/auth/callback?code=...&state=state_id
-
     BE->>R: GETDEL state payload (single-use)
     R-->>BE: {module_client_id, nonce, tenant_id, ...}
+    end
 
+    rect rgb(240, 255, 240)
+    Note over M, R: Phase 3 — Ticket Exchange
     alt Module auth (module_client_id present)
         BE->>R: Store one-time ticket (10–30s TTL)
         BE-->>B: 302 → module callback_url?ticket=...&handoff_state=...
@@ -343,6 +356,7 @@ sequenceDiagram
         M->>B: Set __Host- session cookie
     else Core web login (no module_client_id)
         BE-->>B: JSON {access_token: "..."}
+    end
     end
 ```
 

@@ -400,6 +400,29 @@ def build_step_execution_hash(step) -> str:
 
 **CRITICAL:** The runner does NOT receive a database session from the worker. It creates short-lived sessions only when persisting results.
 
+The following diagram shows the DB connection lifespan per step — the connection is **closed** during the 60+ second LLM call, preventing connection pool exhaustion:
+
+```mermaid
+sequenceDiagram
+    participant Runner as SequentialFlowRunner
+    participant DB as PostgreSQL
+    participant LLM as OpenAI / Azure / On-prem
+
+    Runner->>+DB: Open short-lived session (fetch step config)
+    DB-->>-Runner: Return config + close session
+
+    Note over Runner, LLM: DB connection is CLOSED here<br/>(zero connection pool drag during LLM call)
+
+    Runner->>+LLM: execute_once(prompt, mcp_servers_override)
+    Note right of LLM: 10–120 seconds
+    LLM-->>-Runner: Return output payload
+
+    Runner->>+DB: Open short-lived session (save step result)
+    DB-->>-Runner: Committed + close session
+
+    Note over Runner, DB: Repeat for each step in the flow
+```
+
 ```python
 class SequentialFlowRunner:
     def __init__(self, assistant_service, flow_repo, file_service,
