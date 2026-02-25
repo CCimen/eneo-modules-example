@@ -14,13 +14,13 @@ Det här repot innehåller arkitekturdokumenten för Eneos nya funktioner: Flöd
 
 | File | For whom | What it covers |
 |------|----------|----------------|
-| `ARCHITECTURE.md` | Architects, tech leads | The "Why" and the "Boundaries": module system, network model, auth broker theory, API Key v2 strategy, high-level system components. |
-| `IMPLEMENTATION.md` | Developers, architects | The "What" and the "When": database schema, API endpoint signatures, auth broker endpoints, frontend requirements, 7-PR delivery sequence. |
-| `FLOW_EXECUTION_ENGINE.md` | Backend developers | The "How": SequentialFlowRunner internals, variable interpolation, short-lived DB transactions, SSRF protection, RAG context preservation. |
-| `docker-compose.core.yml` | DevOps, architects | Core infrastructure: Traefik, Frontend, Backend, Worker, PostgreSQL, Redis. Three-network isolation. |
-| `docker-compose.modules.yml` | DevOps, developers | Module overlay: how to add Speech-to-Text, Widget, or any new module. Zero changes to core. |
+| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Architects, tech leads | The "Why" and the "Boundaries": [module system](./ARCHITECTURE.md#part-2-module-system-architecture), [auth broker](./ARCHITECTURE.md#part-3-authentication), [network model](./ARCHITECTURE.md#part-4-network-architecture), [widget embedding](./ARCHITECTURE.md#part-5-widget-architecture), [flow design](./ARCHITECTURE.md#part-6-sequential-flows-flöden), [decision matrix](./ARCHITECTURE.md#part-11-decision-matrix). |
+| [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) | Developers, architects | The "What" and the "When": [data model](./IMPLEMENTATION.md#1-data-model), [flow runner](./IMPLEMENTATION.md#5-sequentialflowrunner), [auth broker endpoints](./IMPLEMENTATION.md#13-auth-broker--ticket-handoff-v39), [frontend](./IMPLEMENTATION.md#14-frontend-implementation), [7-PR delivery sequence](./IMPLEMENTATION.md#16-pr-sequence). |
+| [`FLOW_EXECUTION_ENGINE.md`](./FLOW_EXECUTION_ENGINE.md) | Backend developers | The "How": [variable resolver](./FLOW_EXECUTION_ENGINE.md#variable-resolver-with-json-safe-escaping), [resume determinism](./FLOW_EXECUTION_ENGINE.md#resume-determinism-execution-hash), [SequentialFlowRunner](./FLOW_EXECUTION_ENGINE.md#sequentialflowrunner-manual-db-sessions), [SSRF protection](./FLOW_EXECUTION_ENGINE.md#ssrf--http-features-both-get-and-post), [security classification](./FLOW_EXECUTION_ENGINE.md#security-classification). |
+| [`docker-compose.core.yml`](./docker-compose.core.yml) | DevOps, architects | Core infrastructure: Traefik, Frontend, Backend, Worker, PostgreSQL, Redis. Three-network isolation. |
+| [`docker-compose.modules.yml`](./docker-compose.modules.yml) | DevOps, developers | Module overlay: how to add Speech-to-Text, Widget, or any new module. Zero changes to core. |
 | `taltilltextflow.excalidraw.png` | Everyone | Visual diagram of the Speech-to-Text flow pipeline. |
-| `taltilltextflow.excalidraw` | Designers, architects | Editable diagram source (open with [excalidraw.com](https://excalidraw.com)). |
+| [`taltilltextflow.excalidraw`](./taltilltextflow.excalidraw) | Designers, architects | Editable diagram source (open with [excalidraw.com](https://excalidraw.com)). |
 
 ---
 
@@ -52,7 +52,7 @@ own model, tools, KB`"]
     end
 
     UI --> BFF
-    BFF -->|"internal network"| API
+    BFF -->|"module_net"| API
     API --> Engine
     Engine --> Worker
     Worker --> S1 --> S2 --> S3
@@ -211,7 +211,11 @@ This is deliberate. Municipal processes are inherently linear (receive → analy
 
 **Variable interpolation** connects the steps. A prompt can reference `{{flow_input.field_name}}` for form data or `{{step_2.output.summary}}` for a JSON field from a previous step's output. Variables are JSON-safe escaped to prevent injection in HTTP request bodies.
 
-Deep dive: [IMPLEMENTATION.md](./IMPLEMENTATION.md)
+**Deep dive:**
+- Variable resolver and JSON-safe escaping: [FLOW_EXECUTION_ENGINE.md — Variable Resolver](./FLOW_EXECUTION_ENGINE.md#variable-resolver-with-json-safe-escaping)
+- Flow data model and aggregate root: [IMPLEMENTATION.md — Data Model](./IMPLEMENTATION.md#1-data-model)
+- Input sources and resolution logic: [FLOW_EXECUTION_ENGINE.md — Input Resolution](./FLOW_EXECUTION_ENGINE.md#input-resolution)
+- MCP tool restriction per step: [FLOW_EXECUTION_ENGINE.md — MCP Tool Resolution](./FLOW_EXECUTION_ENGINE.md#mcp-tool-resolution-safe-entity-cloning)
 
 ---
 
@@ -230,27 +234,40 @@ flowchart TB
     Browser["`Browser
 taltilltext.eneo.sundsvall.se`"]
 
-    subgraph Module["STT Module Container"]
+    subgraph Module["STT Module Container (module_net only)"]
         ModUI["`Module UI
 (audio recorder, progress view)`"]
         ModAPI["`Module /api/* routes
 (BFF proxy layer)`"]
     end
 
-    subgraph Core["Eneo Core"]
-        Backend["`Backend API
-eneo_backend:8000`"]
-        DB["PostgreSQL + Redis"]
+    Traefik["`Traefik
+(app_net + module_net)`"]
+
+    Backend["`Backend API — eneo_backend:8000
+(app_net + data_net + module_net)`"]
+
+    Worker["`Worker — ARQ
+(app_net + data_net)`"]
+
+    subgraph data["data_net (internal: true — no egress)"]
+        DB["PostgreSQL + pgvector"]
+        Redis["Redis"]
     end
 
-    Browser --> ModUI
+    Browser -->|"HTTPS"| Traefik
+    Traefik -->|"module_net"| ModUI
     ModUI --> ModAPI
-    ModAPI -->|"module_net (internal)"| Backend
-    Backend -.->|"data_net (isolated)"| DB
+    ModAPI -->|"module_net"| Backend
+    Backend -.->|"data_net"| DB
+    Backend -.->|"data_net"| Redis
+    Worker -.->|"data_net"| DB
+    Worker -.->|"data_net"| Redis
     ModAPI -.->|"BLOCKED — no network path"| DB
 
     style DB fill:#f9f,stroke:#333
-    linkStyle 4 stroke:red,stroke-dasharray:5
+    style Redis fill:#f9f,stroke:#333
+    linkStyle 8 stroke:red,stroke-dasharray:5
 ```
 
 Each module is a standalone server that:
@@ -261,6 +278,8 @@ Each module is a standalone server that:
 4. **Cannot reach the database or Redis** — it can only talk to the backend API
 
 The browser never communicates directly with the Eneo backend when on a module's domain. All requests go through the module's BFF layer, which adds domain-specific logic before forwarding to the backend.
+
+> **Architecture details:** [ARCHITECTURE.md — BFF Pattern](./ARCHITECTURE.md#21-bff-pattern) and [Module Contract](./ARCHITECTURE.md#22-module-contract)
 
 **Why this reduces technical debt and increases flexibility:**
 
@@ -288,10 +307,54 @@ The browser never communicates directly with the Eneo backend when on a module's
 - **System-context backend calls**: module BFF sends `Authorization: Bearer sk_<module_key>` (ticket exchange, health, anonymous widget operations).
 - **Widget module** (public embed): primary security boundary is server-side `sk_` key scoping. CSP `frame-ancestors`, strict Origin/CORS checks, and edge rate limits are defense-in-depth.
 
+**Auth Broker + Ticket Handoff sequence:**
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant M as Module BFF
+    participant BE as Backend
+    participant R as Redis
+    participant IdP as Identity Provider
+
+    B->>M: GET /login
+    M->>M: Generate handoff_state nonce
+    M->>B: Set __Host-handoff cookie + 302
+
+    B->>BE: GET /api/v1/auth/module-initiate<br/>?module_client_id=...&handoff_state=...
+    BE->>R: Store OIDC state payload<br/>(state_id key, 10 min TTL)
+    BE-->>B: 302 → IdP authorize URL
+
+    B->>IdP: Follow redirect, OIDC login
+    IdP-->>B: 302 → /api/v1/auth/callback?code=...&state=state_id
+    B->>BE: GET /api/v1/auth/callback?code=...&state=state_id
+
+    BE->>R: GETDEL state payload (single-use)
+    R-->>BE: {module_client_id, nonce, tenant_id, ...}
+
+    alt Module auth (module_client_id present)
+        BE->>R: Store one-time ticket (10–30s TTL)
+        BE-->>B: 302 → module callback_url?ticket=...&handoff_state=...
+        B->>M: GET /auth/callback?ticket=...&handoff_state=...
+        M->>M: Verify handoff_state matches __Host-handoff cookie
+        M->>BE: POST /api/v1/auth/ticket-exchange<br/>Authorization: Bearer sk_<key><br/>{ticket: "..."}
+        BE->>R: GETDEL ticket (single-use, atomic)
+        BE-->>M: Module-scoped JWT (aud=module, scope, auth_time, exp=15m)
+        M->>B: Set __Host- session cookie
+    else Core web login (no module_client_id)
+        BE-->>B: JSON {access_token: "..."}
+    end
+```
+
+> **Auth deep dive:** [ARCHITECTURE.md — Authentication](./ARCHITECTURE.md#part-3-authentication) | [IMPLEMENTATION.md — Auth Broker Endpoints](./IMPLEMENTATION.md#131-auth-broker-endpoints) | [IMPLEMENTATION.md — Module JWT & Refresh](./IMPLEMENTATION.md#134-module-jwt-claims-auth-patterns-and-refresh)
+
 **Deployment posture:**
 
 - **Docker Compose is the primary and fully supported model** for municipal environments (1–20+ modules).
 - **Kubernetes is reference-only** for organizations that already run K8s and need advanced features (NetworkPolicies, rolling HA, multi-node orchestration).
+
+> **Compose configuration:** [docker-compose.core.yml](./docker-compose.core.yml) (core services) | [docker-compose.modules.yml](./docker-compose.modules.yml) (module overlay)
+> **Versioning and compatibility:** [ARCHITECTURE.md — Versioning, Compose, SDK](./ARCHITECTURE.md#part-79-versioning-compose-sdk)
 
 ### Why Two Safeguards Exist (Determinism + Compatibility)
 
@@ -375,6 +438,9 @@ In the STT example: KBWhisper via Berget/GDM (K1) transcribes audio (not sensiti
 
 **MCP tool restriction per step:** Each step has a tool policy — either `inherit` (use all tools from the underlying assistant) or `restricted` (explicit allowlist only). Step 2 in the STT flow can call `lookup_patient` and `fetch_case`, but Step 3 cannot — even if the underlying assistant has those tools. Tools auto-execute within the pipeline; the allowed set is pre-configured by the flow administrator at design time.
 
+> **Classification enforcement details:** [FLOW_EXECUTION_ENGINE.md — Security Classification](./FLOW_EXECUTION_ENGINE.md#security-classification)
+> **MCP tool resolution internals:** [FLOW_EXECUTION_ENGINE.md — MCP Tool Resolution](./FLOW_EXECUTION_ENGINE.md#mcp-tool-resolution-safe-entity-cloning)
+
 ---
 
 ## Network Architecture
@@ -430,7 +496,9 @@ The platform runs on three Docker networks with strict isolation:
 
 The Backend is the only service that bridges all three networks — the single gateway between the outside world, the data layer, and the modules. Even if a module container is compromised, the attacker has no path to the database.
 
-Reference: [docker-compose.core.yml](./docker-compose.core.yml) and [docker-compose.modules.yml](./docker-compose.modules.yml)
+> **Compose definitions:** [docker-compose.core.yml](./docker-compose.core.yml) (network declarations) | [docker-compose.modules.yml](./docker-compose.modules.yml) (module network attachment)
+> **Architecture rationale:** [ARCHITECTURE.md — Network Architecture](./ARCHITECTURE.md#part-4-network-architecture)
+> **Risk assessment:** [ARCHITECTURE.md — Risk Assessment](./ARCHITECTURE.md#part-13-risk-assessment)
 
 ---
 
@@ -467,6 +535,10 @@ The Speech-to-Text module is not the flow itself. It is a specialized UI wrapper
 The module provides the user experience. The backend provides the flow engine, security enforcement, and audit trail. If you wanted to build a different UI for the same flow — a mobile app, a different web design, an API-only integration — you would build a different module or call the backend API directly. The flow definition stays the same.
 
 This separation is the core value of the module architecture: **the flow engine is generic, the user experience is specialized.**
+
+> **STT module compose config:** [docker-compose.modules.yml](./docker-compose.modules.yml)
+> **Flow runner internals:** [FLOW_EXECUTION_ENGINE.md — SequentialFlowRunner](./FLOW_EXECUTION_ENGINE.md#sequentialflowrunner-manual-db-sessions)
+> **Worker task and cleanup:** [IMPLEMENTATION.md — Worker Task](./IMPLEMENTATION.md#9-worker-task)
 
 ---
 
