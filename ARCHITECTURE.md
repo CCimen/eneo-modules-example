@@ -1,14 +1,12 @@
-# Eneo Platform Expansion — Definitive Architecture v3.9 (Final)
+# Eneo Platform Expansion — Architecture
 
-**Date:** 2026-02-25
-**Status:** Final — v3.9 aligns auth/session lifecycle, module versioning, compose-first operations, and implementation guardrails
 **Scope:** Module system, Flöden (flows), widget, deployment, auth — single release
 
 ---
 
 ## Executive Summary
 
-Architecture for three capabilities: module system, sequential AI flows ("Flöden"), embeddable widget. Validated by independent architectural reviews and aligned to municipal Docker Compose operations.
+Architecture for three capabilities: module system, sequential AI flows ("Flöden"), embeddable widget. Aligned to municipal Docker Compose operations.
 
 **Key insights:**
 - API Key v2 eliminates custom widget auth (~500 LOC removed)
@@ -511,7 +509,7 @@ eneo/
 
 ---
 
-## Part 12: Codebase Alignment (Codex Review — P0/P1 Fixes)
+## Part 12: Codebase Alignment (P0/P1 Fixes)
 
 These findings are from actual codebase inspection (file:line references verified). All P0 items must be fixed before PR 1 merges.
 

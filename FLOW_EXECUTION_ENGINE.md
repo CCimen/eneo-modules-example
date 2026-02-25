@@ -1,4 +1,4 @@
-# Flöden Implementation Plan v3.9 (Final — All Reviews Consolidated)
+# Flöden — Flow Execution Engine
 
 ## Context
 
@@ -6,7 +6,7 @@ Eneo currently has Assistants (conversational), Apps (single-shot), and Group Ch
 
 **Non-breaking:** Flows are a NEW first-class resource. Existing APIs untouched.
 
-**Design principles (7 reviews consolidated):**
+**Design principles:**
 - No mutation of `assistant.mcp_servers` in-place
 - No user-visible sessions polluted by flow runs
 - Explicit MCP allowlist semantics (membership = enabled)
@@ -21,7 +21,7 @@ Eneo currently has Assistants (conversational), Apps (single-shot), and Group Ch
 
 ---
 
-## Codebase Alignment (Codex Review — P0/P1 Required Fixes)
+## Codebase Alignment (P0/P1 Required Fixes)
 
 From actual codebase inspection with file:line references. P0 = blocks first commit. P1 = blocks production.
 
@@ -891,8 +891,6 @@ Subscribe on run page. Per-step: ✅ completed, 🔄 running, ⏳ pending, ❌ f
 - [ ] JSON export downloads full flow definition
 - [ ] PNG/SVG export captures diagram
 
-### (All v3.1 checks also apply)
-
 ---
 
 ## Assumptions
@@ -904,7 +902,6 @@ Subscribe on run page. Per-step: ✅ completed, 🔄 running, ⏳ pending, ❌ f
 - tool_calls_metadata capture verified for non-streaming
 - Svelte Flow is read-only (no building/importing)
 - Graph endpoint computed from flow data (no separate table)
-- Auth Broker + Ticket Handoff is the production auth pattern for modules (see unified implementation plan v3.9)
+- Auth Broker + Ticket Handoff is the production auth pattern for modules (see implementation plan)
 - Module-scoped JWTs used for flow execution on behalf of module users must carry `aud` = module_client_id
 - `prompt_override` (not `instructions_override`) used throughout — matches actual `completion_service.get_response(prompt=...)` API
-- All v3.1 assumptions apply

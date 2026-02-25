@@ -1,7 +1,5 @@
-# Eneo Unified Implementation Plan v3.9 — Final
+# Eneo — Unified Implementation Plan
 
-**Date:** 2026-02-25
-**Status:** Final — v3.9 aligns broker handoff, refresh lifecycle, deterministic resume semantics, and compose-first operations
 **Scope:** Flöden + Modules + Widget + Health Registry + Auth Broker — single release, 7 PRs
 
 ---
@@ -26,7 +24,7 @@
 
 ---
 
-## 0. Codebase Alignment (Codex Review — P0/P1 Fixes Required)
+## 0. Codebase Alignment (P0/P1 Required Fixes)
 
 From actual codebase inspection with file:line references. P0 items MUST be resolved before PR 1 merges.
 
@@ -193,7 +191,7 @@ module_registry
 
 ## 2. Flow Repository (Own Aggregate Root)
 
-**CRITICAL (from Codex review):** Flow is NOT saved via `space_repo._set_flows()`. The Space aggregate saves all nested entities recursively — adding flows would cause massive write latency as every Space update resaves all flow steps, MCP tools, and configs.
+**CRITICAL:** Flow is NOT saved via `space_repo._set_flows()`. The Space aggregate saves all nested entities recursively — adding flows would cause massive write latency as every Space update resaves all flow steps, MCP tools, and configs.
 
 **File:** `backend/src/intric/flows/infrastructure/flow_repo.py`
 
@@ -341,7 +339,7 @@ def interpolate(text: str, context: dict, json_safe: bool = False) -> str:
 
 ### Worker Transaction Isolation
 
-**CRITICAL (from Codex review):** The ARQ `@worker.task` must NOT hold an auto-transaction during flow execution. LLM calls take 60+ seconds — holding a DB connection that entire time exhausts the Postgres pool.
+**CRITICAL:** The ARQ `@worker.task` must NOT hold an auto-transaction during flow execution. LLM calls take 60+ seconds — holding a DB connection that entire time exhausts the Postgres pool.
 
 **Pattern:** The runner does NOT receive a database session from the worker. Instead, it requests short-lived sessions from a session factory only when persisting results.
 
@@ -501,8 +499,7 @@ def _safe_copy(obj):
 Handles: `flow_input`, `previous_step`, `all_previous_steps`, `http_get`, `http_post`.
 `http_post` input: body interpolated with `json_safe=True`.
 
-### SSRF / HTTP / Output Processing (unchanged from v3.1)
-
+### SSRF / HTTP / Output Processing
 Block private IPs + configurable `ALLOWED_INTERNAL_CIDRS`. Header injection blocklist. 3 retries. 1MB cap. Content-type routing. `Idempotency-Key` on webhooks. JSON extraction with markdown stripping.
 
 ---
@@ -566,17 +563,16 @@ async def get_flow_graph(id: UUID, flow_service: FlowService = Depends()):
 
 ---
 
-## 8. API Key v2 + Audit (unchanged from v3.1)
-
+## 8. API Key v2 + Audit
 `flows` in `ResourcePermissions`. Scope resolution: flow_id → space_id. Audit with truncated payloads.
 
 ---
 
 ## 9. Worker Task
 
-**P0-1 (Codex):** `worker.py:445` — `@worker.task` wraps the full task in `session.begin()`. This means any LLM call (60+ seconds) holds a DB connection open.
+**P0-1:** `worker.py:445` — `@worker.task` wraps the full task in `session.begin()`. This means any LLM call (60+ seconds) holds a DB connection open.
 
-**P0-2 (Codex):** `worker.py:431` — `@worker.task` decorator only accepts `with_user` and `channel_type`, NOT `timeout`.
+**P0-2:** `worker.py:431` — `@worker.task` decorator only accepts `with_user` and `channel_type`, NOT `timeout`.
 
 **Fix: Create `long_running_task` pattern** that does not auto-open a session. The runner uses `session_factory` for short-lived persist calls only. Timeout is configured at ARQ worker level (`job_timeout=1800` in ARQ settings), not in the decorator.
 
@@ -604,7 +600,7 @@ async def run_flow(params: FlowRunParams, container, worker_config):
 # flow/user fetch, then runner uses its own sessions for step persistence.
 ```
 
-**P1-8 (Codex):** Container's `SessionProxy` pattern (`container.py:1367`) assumes request-scoped sessions. The runner must use explicit `session_factory` for all DB ops during long-running execution, never the ambient `SessionProxy`.
+**P1-8:** Container's `SessionProxy` pattern (`container.py:1367`) assumes request-scoped sessions. The runner must use explicit `session_factory` for all DB ops during long-running execution, never the ambient `SessionProxy`.
 
 **ARQ timeout:** Set `job_timeout=1800` in ARQ worker config (`arq.py`), not in decorator.
 
@@ -616,11 +612,11 @@ async def run_flow(params: FlowRunParams, container, worker_config):
 **Zombie cleanup (hourly):** 2h threshold.
 **Hidden assistant cleanup (hourly):** Delete orphans with no flow_step reference.
 **Data retention:** `delete_old_flow_runs()` with `generated_file_ids` GC.
-**P1-9 (Codex):** `FileService.delete_file` enforces owner check (`file_service.py:93`). Flow cleanup job running as system can't delete user-uploaded flow files. **Fix:** Add `delete_file_system(file_id, tenant_id)` — tenant-scoped system GC path that bypasses user ownership but requires tenant authorization.
+**P1-9:** `FileService.delete_file` enforces owner check (`file_service.py:93`). Flow cleanup job running as system can't delete user-uploaded flow files. **Fix:** Add `delete_file_system(file_id, tenant_id)` — tenant-scoped system GC path that bypasses user ownership but requires tenant authorization.
 
 ### Flow Validation (API time)
 
-**P1-6 (Codex):** Step 1 with `input_source="previous_step"` = empty input (no previous step exists).
+**P1-6:** Step 1 with `input_source="previous_step"` = empty input (no previous step exists).
 **Fix:** On flow create/update, validate:
 - If `step_order == 1`: reject `previous_step` and `all_previous_steps`. Default to `flow_input`.
 - If `step_order > 1` and `input_source == "flow_input"`: allowed (step re-reads original form data).
@@ -628,15 +624,13 @@ async def run_flow(params: FlowRunParams, container, worker_config):
 
 ---
 
-## 11: Module Template (unchanged from v3.1)
-
+## 11: Module Template
 ---
 
-## 12: Widget (unchanged from v3.1)
-
+## 12: Widget
 ---
 
-## 13: Auth Broker + Ticket Handoff (v3.9)
+## 13: Auth Broker + Ticket Handoff
 
 **Production default:** Auth Broker with one-time ticket exchange. No wildcard shared cookie domain.
 
@@ -1004,7 +998,7 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - [ ] Core web login unchanged and functional
 - [ ] Logout clears module-local cookie only
 
-### (All v3.1 checks also apply — inline builder, form schema, variables, I/O types, security, widget, modules)
+### Additional Checks (inline builder, form schema, variables, I/O types, security, widget, modules)
 
 ---
 
@@ -1022,4 +1016,3 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - No IdP per-module redirect URI registration required (broker centralizes this)
 - Module-scoped JWT prevents blast-radius escalation from compromised modules
 - Docker Compose is the primary deployment model for municipal operations
-- All v3.1 assumptions also apply
