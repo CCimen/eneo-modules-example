@@ -15,10 +15,10 @@ Det här repot innehåller arkitekturdokumenten för Eneos nya funktioner: Flöd
 | File | For whom | What it covers |
 |------|----------|----------------|
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Architects, tech leads | The "Why" and the "Boundaries": [module system](./ARCHITECTURE.md#part-2-module-system-architecture), [auth broker](./ARCHITECTURE.md#part-3-authentication), [network model](./ARCHITECTURE.md#part-4-network-architecture), [widget embedding](./ARCHITECTURE.md#part-5-widget-architecture), [flow design](./ARCHITECTURE.md#part-6-sequential-flows-flöden), [decision matrix](./ARCHITECTURE.md#part-11-decision-matrix). |
-| [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) | Developers, architects | The "What" and the "When": [data model](./IMPLEMENTATION.md#1-data-model), [flow runner](./IMPLEMENTATION.md#5-sequentialflowrunner), [auth broker endpoints](./IMPLEMENTATION.md#13-auth-broker--ticket-handoff), [frontend](./IMPLEMENTATION.md#14-frontend-implementation), [7-PR delivery sequence](./IMPLEMENTATION.md#16-pr-sequence). |
-| [`FLOW_EXECUTION_ENGINE.md`](./FLOW_EXECUTION_ENGINE.md) | Backend developers | The "How": [variable resolver](./FLOW_EXECUTION_ENGINE.md#variable-resolver-with-json-safe-escaping), [resume determinism](./FLOW_EXECUTION_ENGINE.md#resume-determinism-execution-hash), [SequentialFlowRunner](./FLOW_EXECUTION_ENGINE.md#sequentialflowrunner-manual-db-sessions), [SSRF protection](./FLOW_EXECUTION_ENGINE.md#ssrf--http-features-both-get-and-post), [security classification](./FLOW_EXECUTION_ENGINE.md#security-classification). |
+| [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) | Developers, architects | The "What" and the "When": [data model](./IMPLEMENTATION.md#1-data-model), [Celery flow sub-track](./IMPLEMENTATION.md#19-celery-sub-track-for-flows-additive-to-unified-7-pr-program), [legacy flow runner context](./IMPLEMENTATION.md#5-sequentialflowrunner-legacy-arq-reference), [auth broker endpoints](./IMPLEMENTATION.md#13-auth-broker--ticket-handoff), [frontend](./IMPLEMENTATION.md#14-frontend-implementation), [delivery sequence](./IMPLEMENTATION.md#16-pr-sequence). |
+| [`FLOW_EXECUTION_ENGINE.md`](./FLOW_EXECUTION_ENGINE.md) | Backend developers | The "How": [variable resolver](./FLOW_EXECUTION_ENGINE.md#variable-resolver-with-json-safe-escaping), [resume determinism](./FLOW_EXECUTION_ENGINE.md#resume-determinism-execution-hash), [Celery runtime overlay](./FLOW_EXECUTION_ENGINE.md#celery-runtime-overlay-supersedes-arq-specific-flow-task-mechanics), [legacy SequentialFlowRunner reference](./FLOW_EXECUTION_ENGINE.md#sequentialflowrunner-manual-db-sessions-legacy-arq-reference), [SSRF protection](./FLOW_EXECUTION_ENGINE.md#ssrf--http-features-both-get-and-post), [security classification](./FLOW_EXECUTION_ENGINE.md#security-classification). |
 | [`docker-compose.core.yml`](./docker-compose.core.yml) | DevOps, architects | Core infrastructure: Traefik, Frontend, Backend, Worker, PostgreSQL, Redis. Three-network isolation. |
-| [`docker-compose.modules.yml`](./docker-compose.modules.yml) | DevOps, developers | Module overlay: how to add Speech-to-Text, Widget, or any new module. Zero changes to core. |
+| [`docker-compose.modules.yml`](./docker-compose.modules.yml) | DevOps, developers | Module overlay: how to add Speech-to-Text, Widget, or any new module. No core changes for module-only additions. |
 | `taltilltextflow.excalidraw.png` | Everyone | Visual diagram of the Speech-to-Text flow pipeline. |
 | [`taltilltextflow.excalidraw`](./taltilltextflow.excalidraw) | Designers, architects | Editable diagram source (open with [excalidraw.com](https://excalidraw.com)). |
 
@@ -26,7 +26,7 @@ Det här repot innehåller arkitekturdokumenten för Eneos nya funktioner: Flöd
 
 ## The Big Picture
 
-Here is the overall model. A **Flow** is a sequential AI pipeline. A **Module** is a standalone UI service (following the BFF — Backend For Frontend — pattern) that triggers flows via the backend API.
+Here is the overall model. A **Flow** starts as a linear AI pipeline (with DAG-ready schema/runtime boundaries). A **Module** is a standalone UI service (following the BFF — Backend For Frontend — pattern) that triggers flows via the backend API.
 
 ```mermaid
 flowchart LR
@@ -37,9 +37,12 @@ flowchart LR
 
     subgraph Eneo["Eneo Core"]
         API["Backend API"]
-        Engine["Flow Engine"]
-        Worker["`Worker
-(ARQ task queue)`"]
+        Engine["`Flow Engine
+(compiler + runtime boundary)`"]
+        CeleryFlowWorker["`Flow Worker
+(Celery queue runtime)`"]
+        LegacyWorker["`Legacy Worker
+(ARQ non-flow jobs)`"]
     end
 
     subgraph Flow["Flow Pipeline"]
@@ -54,8 +57,9 @@ own model, tools, KB`"]
     UI --> BFF
     BFF -->|"module_net"| API
     API --> Engine
-    Engine --> Worker
-    Worker --> S1 --> S2 --> S3
+    Engine --> CeleryFlowWorker
+    API -->|"non-flow jobs"| LegacyWorker
+    CeleryFlowWorker --> S1 --> S2 --> S3
 ```
 
 The module handles the user experience. The backend handles execution, security, and audit. The flow defines what each AI step does. These three concerns are independent — you can change the module UI without touching the flow, or modify a step's prompt without redeploying the module.
@@ -197,9 +201,9 @@ After Step 3 completes, the generated DOCX is stored in Eneo (downloadable from 
 
 ### Eneo Flows (Flöden)
 
-A flow is a sequential AI pipeline: **Start → Step 1 → Step 2 → Step 3 → End**. Each step is a full AI agent with its own prompt, model, knowledge base, and MCP (Model Context Protocol) tools. Steps execute one after another — no loops, no branching, no conditional logic.
+A flow is linear-first: **Start → Step 1 → Step 2 → Step 3 → End** in the first execution phase. Each step is a full AI agent with its own prompt, model, knowledge base, and MCP (Model Context Protocol) tools. The data model is DAG-ready, but branch/join execution is explicitly gated to the DAG phase. Loops and ad-hoc conditional graph logic are not enabled in V1.
 
-This is deliberate. Municipal processes are inherently linear (receive → analyze → decide → archive). A strict forward-only pipeline means every execution is fully auditable — you can export the exact sequence of what happened, what each model saw, and what it produced. Non-technical administrators can build and modify flows without understanding graph theory.
+This is deliberate. Municipal processes are often linear (receive → analyze → decide → archive), and linear launch keeps implementation and auditability predictable. DAG capability is still designed in from day one so we can add fan-out/fan-in later without schema rewrites.
 
 **What each step can do:**
 
@@ -239,8 +243,8 @@ taltilltext.eneo.sundsvall.se`"]
 (reverse proxy)`"]
         Frontend["`Frontend
 (SvelteKit)`"]
-        Worker["`Worker
-(ARQ)`"]
+        Worker["`Workers
+(ARQ legacy + Celery flows)`"]
     end
 
     subgraph ModuleNet["module_net (Isolated BFFs)"]
@@ -293,7 +297,7 @@ The browser never communicates directly with the Eneo backend when on a module's
 - **Independent deployment.** The STT team ships on their own schedule. No coordination with the core team unless the backend API changes.
 - **Opt-in activation.** Modules are enabled via Docker profiles (`--profile speech-to-text`). Municipalities that don't need STT don't run the container — zero resource cost, zero attack surface.
 - **Clean contracts.** The backend API is the only interface between core and modules. This forces good API design and prevents the internal coupling that makes monoliths hard to change over time.
-- **Zero core changes.** Adding a new module requires 8 steps, none of which touch `docker-compose.core.yml` or any backend code.
+- **Zero core changes for module-only additions.** Adding a new module requires 8 steps, none of which touch backend core codepaths.
 
 **Adding a new module in practice:**
 
@@ -383,7 +387,7 @@ This section explains the intent in plain language. If you need implementation d
 - If upstream logic or topology changed: rerun from step 1.
 - If upstream logic is unchanged: resume from first failed step.
 
-**Hashed (affects execution):** `assistant_id`, prompt text, `completion_model.id`, `mcp_policy`, restricted `mcp_tool_allowlist`, `input_source`, `input_config`, `output_mode`, `output_type`, `output_config`, `output_classification_override`.
+**Hashed (affects execution):** `flow_version`, `step_id`, `assistant_id`, prompt text, `completion_model.id`, `mcp_policy`, restricted `mcp_tool_allowlist`, `input_source`, `input_config`, `input_bindings`, `output_mode`, `output_type`, `output_config`, `output_classification_override`, `input_contract`, `output_contract`, normalized input-context hash.
 
 **Not hashed (cosmetic):** `user_description`, icons, timestamps, UI-only rendering hints.
 
@@ -391,7 +395,7 @@ This prevents "Frankenstein runs" while avoiding unnecessary reruns from label/t
 
 **Read more:**
 - Hash semantics and resume rules: [FLOW_EXECUTION_ENGINE.md — Resume Determinism (Execution Hash)](./FLOW_EXECUTION_ENGINE.md#resume-determinism-execution-hash)
-- API contract and acceptance checks: [IMPLEMENTATION.md — 13.4 Module JWT Claims, Auth Patterns, and Refresh](./IMPLEMENTATION.md#134-module-jwt-claims-auth-patterns-and-refresh)
+- API contract and acceptance checks: [IMPLEMENTATION.md — Celery Sub-Track for Flows](./IMPLEMENTATION.md#19-celery-sub-track-for-flows-additive-to-unified-7-pr-program)
 - Architectural decision record: [ARCHITECTURE.md — Part 11: Decision Matrix](./ARCHITECTURE.md#part-11-decision-matrix)
 
 #### `module_registry` extension fields (operator predictability)
@@ -473,8 +477,8 @@ The platform runs on three Docker networks with strict isolation:
  ┃  app_net             │          │                                       ┃
  ┃                      ▼          │                                       ┃
  ┃   ┌──────────┐  ┌──────────┐   │   ┌─────────────┐                      ┃
- ┃   │ Frontend │  │  Worker  │   │   │   Backend   │◄── bridges all 3     ┃
- ┃   │ (Svelte) │  │  (ARQ)   │   │   │  (FastAPI)  │    networks          ┃
+ ┃   │ Frontend │  │ Workers  │   │   │   Backend   │◄── bridges all 3     ┃
+ ┃   │ (Svelte) │  │ ARQ+Cel. │   │   │  (FastAPI)  │    networks          ┃
  ┃   └──────────┘  └─────┬────┘   │   └──┬───────┬──┘                      ┃
  ┃                        │        │      │       │                        ┃
  ┗━━━━━━━━━━━━━━━━━━━━━━━━│━━━━━━━━│━━━━━━│━━━━━━━│━━━━━━━━━━━━━━━━━━━━━━━━┛
@@ -551,8 +555,9 @@ The module provides the user experience. The backend provides the flow engine, s
 This separation is the core value of the module architecture: **the flow engine is generic, the user experience is specialized.**
 
 > **STT module compose config:** [docker-compose.modules.yml](./docker-compose.modules.yml)
-> **Flow runner internals:** [FLOW_EXECUTION_ENGINE.md — SequentialFlowRunner](./FLOW_EXECUTION_ENGINE.md#sequentialflowrunner-manual-db-sessions)
-> **Worker task and cleanup:** [IMPLEMENTATION.md — Worker Task](./IMPLEMENTATION.md#9-worker-task)
+> **Flow runtime internals (current):** [FLOW_EXECUTION_ENGINE.md — Celery Runtime Overlay](./FLOW_EXECUTION_ENGINE.md#celery-runtime-overlay-supersedes-arq-specific-flow-task-mechanics)
+> **Legacy runner reference:** [FLOW_EXECUTION_ENGINE.md — SequentialFlowRunner](./FLOW_EXECUTION_ENGINE.md#sequentialflowrunner-manual-db-sessions-legacy-arq-reference)
+> **Worker plan and cleanup contracts:** [IMPLEMENTATION.md — Celery Sub-Track](./IMPLEMENTATION.md#19-celery-sub-track-for-flows-additive-to-unified-7-pr-program)
 
 ---
 
@@ -562,8 +567,49 @@ This separation is the core value of the module architecture: **the flow engine 
 
 - **[IMPLEMENTATION.md](./IMPLEMENTATION.md)** — The "What" and the "When". Database schema, API endpoints, auth broker implementation, worker tasks, frontend components, and the 7-PR delivery sequence.
 
-- **[FLOW_EXECUTION_ENGINE.md](./FLOW_EXECUTION_ENGINE.md)** — The "How". Variable resolution, classification validation, SequentialFlowRunner, SSRF protection, short-lived DB transactions, and codebase alignment fixes.
+- **[FLOW_EXECUTION_ENGINE.md](./FLOW_EXECUTION_ENGINE.md)** — The "How". Variable resolution, classification validation, Celery runtime overlay, legacy SequentialFlowRunner context, SSRF protection, short-lived DB transactions, and codebase alignment fixes.
 
 - **[docker-compose.core.yml](./docker-compose.core.yml)** — Core infrastructure. Defines the three-network model and all core services. This file never changes when adding modules.
 
 - **[docker-compose.modules.yml](./docker-compose.modules.yml)** — Module overlay. STT and Widget module configs, plus step-by-step instructions for adding new modules.
+
+---
+
+## Flow Runtime Upgrade (Celery-first, gradual ARQ coexistence)
+
+This repository now uses a merged planning position:
+
+- The original domain context in this README remains the baseline (modules, auth broker, widget, STT scenario, MCP, SSRF, compliance export).
+- Flow runtime execution guidance is upgraded to a Celery-first model.
+- ARQ remains for existing non-flow workloads during gradual migration.
+
+### What changed vs prior plan
+
+1. We did not remove module/auth/widget architecture. Those sections remain authoritative.
+2. We supersede flow execution internals from ARQ-specific behavior to a Celery-first flow engine.
+3. We keep gradual coexistence: ARQ for legacy jobs, Celery for Flows.
+4. We add DAG-ready runtime constraints and stronger failure/isolation contracts.
+
+### Runtime supersedence note
+
+Where this README or linked legacy sections mention ARQ as the flow executor, treat that as historical context. The current flow runtime contract is:
+
+- Linear: Celery `chain`
+- Branch/join (DAG phase): Celery `group/chord`
+- Chord invariant: result backend enabled and chord-participating tasks `ignore_result=False`
+- Tenant isolation invariant: composite tenant FKs + tenant-scoped queries on execution paths
+- Tenancy scope policy: strict DB integrity first, defer heavier machinery (for example RLS) unless required
+- Mandatory terminal lifecycle handling (`on_failure`) and stale-run reconciliation
+- Version-pinned run definitions (`flow_versions`) and deterministic idempotency contracts
+- Auditability invariant: run-context evidence export must be reproducible (inputs/outputs, prompt/model params, tool/knowledge traces, version-pinned graph)
+- Retention invariant: referenced audit artifacts are policy-governed (admin/legal retention), while automatic GC only removes unreferenced technical orphan artifacts
+- Explainability invariant: Dry Run preview is compile-time only (no provider/tool calls), used to validate bindings/models/classification before execution
+
+See:
+- `FLOW_EXECUTION_ENGINE.md` section "Celery Runtime Overlay (Supersedes ARQ-specific flow task mechanics)"
+- `IMPLEMENTATION.md` section "Celery Sub-Track for Flows (Additive to Unified 7-PR Program)"
+
+### Source-of-truth policy
+
+`modulesdocs/` is the forward source-of-truth documentation set.
+`modulez/` is preserved as historical baseline/reference during this merge window.

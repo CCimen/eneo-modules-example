@@ -1,7 +1,19 @@
 # ============================================================================
 # ENEO CORE — docker-compose.core.yml (Definitive)
 # ============================================================================
-# This file NEVER changes when adding modules.
+# This file remains the stable core baseline.
+#
+# IMPORTANT FOR FLOWS:
+# - Flow execution is Celery-first and defined in this core file as `celery-worker-flows`.
+# - ARQ worker in this file remains for existing non-flow jobs.
+# - Do not move flow workloads into this ARQ worker.
+# - Redis keyspace isolation is required:
+#   - auth broker ticket/state keys
+#   - Celery broker keys
+#   - Celery result backend keys
+#   - backend startup should fail fast if configured logical DB indexes collide
+#   - Recommended logical DB split (or separate instances):
+#     ARQ=0, Celery broker=2, Celery result backend=3, auth broker state/tickets=4
 #
 # Architecture:
 #   app_net     — Frontend, Backend, Worker, Traefik. Egress OK.
@@ -13,12 +25,16 @@
 # Modules use internal backend URL (http://eneo_backend:8000) for ticket exchange.
 # Modules CANNOT reach DB or Redis.
 #
-# Start:
+# Start (core only):
 #   docker compose -f docker-compose.core.yml up -d
 #
 # With modules:
 #   docker compose -f docker-compose.core.yml -f docker-compose.modules.yml \
 #                  --profile speech-to-text --profile widget up -d
+#
+# With modules + Celery Flows worker (planned run mode):
+#   docker compose -f docker-compose.core.yml -f docker-compose.modules.yml \
+#                  --profile speech-to-text --profile widget --profile flows-celery up -d
 # ============================================================================
 
 name: eneo
@@ -141,7 +157,36 @@ services:
       - app_net
       - data_net
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Planned flow engine worker (Celery-first for flows)
+  celery-worker-flows:
+    image: ghcr.io/eneo-ai/eneo-backend:${ENEO_VERSION:-latest}
+    container_name: eneo_celery_worker_flows
+    restart: unless-stopped
+    profiles: ["flows-celery"]
+    environment:
+      - RUN_AS_CELERY_WORKER=true
+      - FLOW_CELERY_QUEUE=flows.execute
+    env_file: env_backend.env
+    volumes:
+      - eneo_backend_data:/app/data
+      - eneo_temp_files:/tmp
+    networks:
+      - app_net
+      - data_net
+    depends_on:
+      backend:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   db:
     image: pgvector/pgvector:pg16
@@ -162,7 +207,10 @@ services:
     image: redis:7-alpine
     container_name: eneo_redis
     restart: unless-stopped
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    # Production recommendation: noeviction avoids silent loss of active auth tickets
+    # or queued task metadata under memory pressure. Capacity and alerting must be sized accordingly.
+    # REDIS_MAXMEMORY is parameterized for environment-specific sizing.
+    command: redis-server --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy noeviction
     volumes:
       - eneo_redis_data:/data
     networks:

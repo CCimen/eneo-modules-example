@@ -405,7 +405,7 @@ Returns a node/edge structure for visualization:
 - **Not for building/editing flows** — purely visualization and compliance
 
 **Stateful visualizer (run results view):**
-When the Översikt tab is accessed from a completed `FlowRun` (not the editor), the graph endpoint receives `?run_id=` and returns per-step execution status + timing. Svelte Flow then:
+When the Översikt tab is accessed from a completed `FlowRun` (not the editor), the graph endpoint receives `?run_id=` and must render from the immutable `flow_versions.definition_json` snapshot pinned by `flow_runs.flow_version` (not the live edited flow definition), then attach run status/timing overlays. Svelte Flow then:
 - Colors completed nodes green, failed nodes red, skipped nodes gray
 - Shows execution time inside each node ("2.3s", "14.7s")
 - Shows token usage badge on each LLM node
@@ -413,6 +413,19 @@ When the Översikt tab is accessed from a completed `FlowRun` (not the editor), 
 
 **Export buttons on Översikt tab:**
 - "Ladda ner flöde (JSON)" — full flow definition for compliance audit
+  - run context: version-pinned snapshot
+  - editor context: current draft/live definition
+- "Ladda ner körningsunderlag (JSON)" — run evidence package (run context only) containing:
+  - run metadata (`flow_run_id`, `tenant_id`, `flow_id`, `flow_version`, timestamps, status)
+  - original run input envelope (policy-redacted where required)
+  - per-step execution evidence:
+    - `step_id`, `step_order`, classification, effective prompt text
+    - model/provider + execution params (`temperature`, `top_p`, `max_tokens` when configured)
+    - output envelope / artifact references
+    - token metrics, latency, error metadata
+    - `tool_calls_metadata` and MCP call trace references
+    - knowledge retrieval references are optional in V1 and included when already available from existing metadata paths
+  - endpoint contract: `GET /api/v1/flow-runs/{id}/evidence`
 - "Ladda ner diagram (PNG)" — `html-to-image` library captures Svelte Flow DOM → download
 - "Ladda ner diagram (SVG)" — vector format for print/reports
 
@@ -424,6 +437,18 @@ When the Översikt tab is accessed from a completed `FlowRun` (not the editor), 
 4. Each step: system prompt, model name, classification level, I/O types
 5. If from a specific run: execution times, token counts, pass/fail status per step
 This is what municipal auditors need when evaluating AI decision-making.
+
+**Audit evidence preservation contract (municipal/government requests):**
+- Evidence for a completed run must be reproducible from immutable `flow_versions.definition_json` + persisted run/step evidence.
+- Referenced audit artifacts (step outputs, generated files, evidence package attachments) are never removed by technical GC.
+- Deletion of referenced audit artifacts is allowed only via explicit admin retention policy (or legal-hold release workflow when applicable).
+- Technical orphan sweep may delete only unreferenced crash-window artifacts (see Part 16.8).
+
+**Dry Run Preview (Minimal V1):**
+- compile-time explainability/debug view
+- validates bindings, model availability, and classification compatibility
+- overlays expected execution path on Svelte Flow for stakeholder review before execution
+- MUST NOT execute HTTP calls, MCP tool invocations, model completions, or webhook deliveries
 
 ---
 
@@ -480,7 +505,7 @@ eneo/
 | 2 | Networks | **3-tier** | Modules can't reach DB |
 | 3 | Module user auth | **Auth Broker + Ticket Handoff** | Module isolation, no shared cookies, no IdP sprawl |
 | 3b | Service auth | **`sk_` API Key v2** | Already built |
-| 4 | Flow execution | **`execute_once()`** | Preserves RAG |
+| 4 | Flow execution | **Celery orchestration + `execute_once()` step calls** | Uses native canvas while preserving RAG path |
 | 5 | Flow DDD boundary | **Own aggregate root** | Avoids Space write latency |
 | 6 | Step definition | **Inline builder + hidden assistants** | One-page UX |
 | 7 | Flow input | **Form schema in metadata_json** | Non-technical users |
@@ -605,3 +630,206 @@ Container's SessionProxy pattern (`container.py:1367`) assumes request-scoped se
 | `docs/security.md` | Classification, SSRF, webhook header handling |
 | `modules/README.md` (new) | Module dev guide, contract, hooks |
 | `CHANGELOG.md` | Flows, modules, widget, inline builder, compliance export |
+
+---
+
+## Part 16: Flow Runtime Upgrade Overlay (Celery-first, additive)
+
+This part is additive and supersedes ARQ-specific flow execution mechanics in earlier sections, while preserving all module/auth/widget/network decisions.
+
+### 16.1 Engine Boundary
+
+- Flows execute on Celery from day 1 of flow rollout.
+- ARQ remains for existing non-flow workloads.
+- Keep both workers during migration window; do not route flow runs to ARQ.
+
+### 16.2 Orchestration Model
+
+- Linear flows compile to Celery `chain`.
+- DAG fan-out/fan-in compiles to `group` + `chord`.
+- Linear phase guardrail: reject branch/join graphs until DAG execution phase is enabled.
+- Chord prerequisite: result backend must be enabled and chord-participating tasks must not ignore results.
+
+### 16.3 Runtime Contracts (Reliability)
+
+- Base task lifecycle hooks are mandatory:
+  - `on_retry` for telemetry.
+  - `on_failure` for terminal DB transition.
+- Step execution must be redelivery-safe:
+  - worker performs preflight before provider calls (`flow.deleted_at IS NULL`, run not terminal)
+  - at run creation, pre-seed one `pending` `flow_step_results` row per step
+  - worker claims step via atomic CAS (`pending|failed -> running`); CAS loser exits immediately
+  - `attempt_no` allocation must be concurrency-safe (`MAX()+1` forbidden)
+- Cancellation is explicit and idempotent:
+  - `queued|running -> cancelled`
+  - pending tasks revoked by task id
+  - running tasks re-check cancel state before provider side effects
+- Hard-crash reconciliation is required for OOM/SIGKILL paths where hooks cannot run.
+
+### 16.3.1 Canonical State Machine (authoritative)
+
+Use this as the single source of truth for state transitions. If another section conflicts, this table wins.
+
+`flow_runs.status`
+- `queued -> running | cancelled | failed`
+- `running -> completed | failed | cancelled`
+- terminal: `completed`, `failed`, `cancelled` (no outbound transitions)
+- resume policy: only `failed` may resume; `cancelled` requires new run
+
+`flow_step_results.status`
+- `pending -> running | cancelled | failed`
+- `running -> completed | failed | cancelled`
+- `failed -> running` only for retry reclaim before run terminalization
+- `completed` is terminal for step generation (delivery/webhook failures do not downgrade this status)
+- terminal: `completed`, `cancelled` (and `failed` once run is terminalized)
+
+`flow_step_attempts.status` (append-only)
+- `started -> retried | completed | failed | cancelled`
+- `retried` indicates scheduled handoff to a later attempt row; it is terminal for that attempt record
+- terminal: `retried`, `completed`, `failed`, `cancelled`
+
+Execution invariants:
+- `retried` is attempt-level only (`flow_step_attempts`), not a `flow_step_results` status.
+- CAS claim is mandatory before provider call (`pending|failed -> running` on step-result row).
+- CAS claim, attempt-row creation, and run/step timestamps should be committed in one DB transaction.
+- duplicate task deliveries that fail CAS must exit without side effects.
+- webhook/output delivery failures must preserve completed step output and only affect run/delivery path.
+
+### 16.4 Data and Idempotency Contracts
+
+- Broker payload is IDs only.
+- Context rehydration uses DB as source of truth.
+- Deterministic idempotency hash includes:
+  - `flow_run_id`, `step_id`
+  - step config/version fingerprint
+  - model/provider config fingerprint
+  - normalized input-context hash
+- Runs are version-pinned:
+  - immutable `flow_versions(flow_id, version, definition_checksum, definition_json)`
+  - FK from `flow_runs(flow_id, flow_version)` to `flow_versions(flow_id, version)`
+- `flow_versions.definition_json` stores the immutable runtime snapshot:
+  - flow metadata (`name`, `description`, retention/insight config, form schema)
+  - ordered step definitions (`step_id`, `step_order`, assistant/model/prompt, model execution params such as `temperature`/`top_p`/`max_tokens`, MCP policy and allowlist, input/output settings, contracts, bindings, classification overrides)
+  - canonicalized before checksum generation
+- `flow_step_results` stores runtime evidence snapshot fields:
+  - `effective_prompt` (post-interpolation prompt actually sent)
+  - `model_parameters_json` (resolved effective runtime model/provider parameters at execution time, not only configured defaults)
+
+### 16.5 DAG Integrity
+
+- Dependency table uses `flow_step_dependencies(flow_id, parent_step_id, child_step_id)`.
+- Constraints:
+  - unique `(flow_id, parent_step_id, child_step_id)`
+  - no self-edge
+  - composite FK `(flow_id, parent_step_id)` and `(flow_id, child_step_id)` to `flow_steps`
+  - `flow_steps` must expose unique `(flow_id, id)` key (or composite PK)
+- Cross-flow edges are forbidden by schema, not only service logic.
+
+### 16.6 Tenant and Ownership Integrity
+
+- DB-level tenant integrity is mandatory for execution tables (`flow_runs`, `flow_step_results`, outbox/attempt rows).
+- Required composite FK chain:
+  - `flow_runs(flow_id, tenant_id) -> flows(id, tenant_id)`
+  - `flow_step_results(flow_run_id, tenant_id) -> flow_runs(id, tenant_id)`
+  - `flow_step_attempts(flow_run_id, tenant_id) -> flow_runs(id, tenant_id)`
+- Required same-flow execution FK chain:
+  - execution rows include denormalized `flow_id`
+  - `flow_step_results(flow_run_id, flow_id) -> flow_runs(id, flow_id)`
+  - `flow_step_attempts(flow_run_id, flow_id) -> flow_runs(id, flow_id)`
+  - `(flow_id, step_id) -> flow_steps(flow_id, id)` (when `step_id` is not null)
+- Execution-table step references:
+  - `flow_step_results.step_id -> flow_steps.id` uses `SET NULL`
+  - `flow_step_attempts.step_id -> flow_steps.id` uses `SET NULL`
+  - rationale: avoids sibling-cascade ordering conflicts during tenant/space/flow deletes while preserving historical execution logs
+- Query-access rule:
+  - every flow/read-write query must scope by authenticated `tenant_id`
+  - no flow lookup may rely on `id` alone without tenant constraint
+  - repository/service interfaces should require `tenant_id` parameters for execution-path reads/writes
+- Isolation guarantee:
+  - same logical flow name in tenant A and tenant B is independent by design
+  - tenant-scoped constraints prevent cross-tenant linkage even under service bugs
+- Scope control (avoid overengineering):
+  - phase uses composite FK enforcement as the primary tenant guardrail
+  - no mandatory RLS/trigger layer in this phase
+  - add RLS only if compliance or threat model requires per-query tenant policy enforcement beyond FK integrity
+- SQL guardrail note:
+  - parent tables must expose composite uniqueness used by FKs
+  - `flows` requires `UNIQUE(id, tenant_id)`
+  - `flow_runs` requires `UNIQUE(id, tenant_id)`
+  - `flow_runs` requires `UNIQUE(id, flow_id)`
+- Ownership/cascade policy for flows:
+  - `created_by_user_id` and `owner_user_id` use `ON DELETE SET NULL`
+  - structural containment (`tenant_id`, `space_id`) uses `CASCADE`
+  - `flow_steps.assistant_id` uses `RESTRICT`
+- Rationale:
+  - user references are accountability metadata and must not delete organizational assets
+  - tenant/space references are structural boundaries; deleting them invalidates the flow context
+- Soft-delete policy:
+  - reject new runs for soft-deleted flows
+  - queued/unclaimed steps in existing runs must not call providers after soft-delete (preflight short-circuit)
+  - already in-flight provider calls may finish once; reconciler/finalizer must close run deterministically (`cancelled` or `failed` with reason code)
+
+### 16.7 I/O Quality Contracts
+
+- Each step definition must include explicit `input_contract`, `output_contract`, and `input_bindings`.
+- Contract model:
+  - `input_contract` / `output_contract` use a documented JSON Schema subset (Draft 7 compatible subset) with explicit `type`, `required`, and `properties/items` fields for JSON payloads
+  - non-JSON contracts (`text`, `image`, `audio`, `document`, `file`) use typed envelope metadata (`type`, `format`, size/count constraints)
+- Publish-time checks:
+  - required inputs are fully bound
+  - source exists
+  - type compatibility holds
+- Binding vs interpolation boundary:
+  - `input_bindings` is compile-time wiring used by `FlowCompiler` to map source fields to step input fields
+  - `{{...}}` interpolation is runtime templating inside prompt/body/url strings after bound input context is built
+  - DAG phase migration note: preserve human-readable interpolation aliases in branched graphs; do not force UUID-based prompt keys.
+- Fan-in mapping is explicit and deterministic:
+  - default namespaced parent outputs
+  - flattening requires explicit aliasing
+- Inline payloads are bounded with explicit defaults:
+  - `max_inline_text_bytes = 1_048_576` (1 MiB)
+  - `max_inline_json_bytes = 1_048_576` (1 MiB serialized JSON)
+  - `max_inline_preview_bytes = 16_384` (16 KiB)
+- Large outputs use artifact references rather than oversized inline payloads.
+- Bounds are enforced immediately after model response, before websocket broadcast, logging, and persistence.
+
+### 16.8 Database Maintainability Rules
+
+- Keep retry history append-only (`flow_step_attempts`) and final outputs in `flow_step_results`.
+- Required operational indexes:
+  - `flow_runs(flow_id, status)`
+  - `flow_runs(tenant_id, created_at)`
+  - `flow_step_results(flow_run_id, flow_id, step_id)`
+  - `flow_step_attempts(flow_run_id, flow_id, step_id, attempt_no)`
+  - `flows(space_id, deleted_at)`
+- Add terminal-state check constraints (for example finished timestamp consistency).
+- Apply retention cleanup for runs/results/outbox to avoid unbounded growth.
+- Artifact deletion policy split (mandatory):
+  - Auditable/business artifacts referenced by persisted completed step results are not deleted by automatic technical GC.
+  - Retention-driven purge of referenced artifacts must be explicit admin policy (same governance class as audit/conversation retention), not implicit runtime cleanup.
+  - Automatic cleanup is limited to technical garbage/orphans created by crash/cancel windows.
+- Orphan artifact contract (minimal V1):
+  - every generated flow artifact is tagged at creation with `tenant_id`, `flow_run_id`, `flow_id`, `created_at`, optional `step_id`
+  - hourly orphan sweep uses configurable `orphan_grace_minutes` (default `60`)
+  - delete only when:
+    - artifact age is above grace, and
+    - associated `flow_run_id` is missing OR run is terminal (`failed|cancelled`), and
+    - artifact is not referenced by any `completed` `flow_step_results.output_payload_json.generated_file_ids`
+  - all deletes are tenant-scoped (`delete_file_system(file_id, tenant_id)`), never cross-tenant/global
+
+### 16.9 Runtime Operability (Celery + Redis)
+
+- Async bridge requirement:
+  - one persistent async runtime per Celery worker child
+  - do not use per-task `asyncio.run()`
+- Redis isolation requirement:
+  - isolate Celery broker/result keyspace from auth broker ticket/state keys
+  - production eviction policy must not silently evict active task/ticket data (`noeviction`)
+  - startup must fail fast if configured Redis logical DB indexes collide across ARQ, Celery broker/result, and auth ticket/state keys
+- Observability requirement:
+  - queue depth, retries, failure rate, and stuck-run counts must be exposed
+  - worker/broker/result-backend health must be checked by ops endpoints
+
+### 16.10 Superseded Behavior Marker
+
+All ARQ-specific flow execution references in earlier sections are historical context only. Module/auth/widget/security architecture remains valid and unchanged.

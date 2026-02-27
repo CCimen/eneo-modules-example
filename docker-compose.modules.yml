@@ -3,12 +3,18 @@
 # ============================================================================
 # Each module is a BFF: serves UI + proxies API calls to backend internally.
 # Adding a module ONLY requires changes to THIS file + .env + module env files.
-# docker-compose.core.yml NEVER changes.
+# `docker-compose.core.yml` should not change for module-only feature additions.
+# Core infrastructure evolution (for example flow runtime worker topology) is handled in core.
 #
 # Auth model:
 #   User auth:    Auth Broker + Ticket Handoff (backend-centralized OIDC, one-time
 #                 ticket exchange, module-scoped JWT). No cross-subdomain shared cookies.
 #   Service auth: sk_ API key per module (created in Eneo admin UI)
+#
+# Flows execution path:
+#   Module UI/BFF -> Backend API -> Celery Flow Engine
+#   (ARQ remains for legacy non-flow workloads only)
+#   Celery flow worker is defined in docker-compose.core.yml (`celery-worker-flows`).
 #
 # Usage:
 #   docker compose -f docker-compose.core.yml -f docker-compose.modules.yml \
@@ -129,5 +135,5 @@ services:
   # 5. Create sk_ API key in Eneo admin UI (scoped, IP-restricted)
   # 6. Add module secrets to env_module_mymod.env (optionally shared defaults in env_modules.env)
   # 7. Add to CI build matrix
-  # 8. Done. ZERO changes to docker-compose.core.yml.
+  # 8. Done. No core changes required for module-only additions.
   # --------------------------------------------------------------------------

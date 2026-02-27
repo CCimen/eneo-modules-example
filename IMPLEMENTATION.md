@@ -16,7 +16,7 @@
 8. **Reuse API Key v2** for all service-level auth
 9. **Incremental step result persistence** — each step saved immediately
 10. **Configurable SSRF protection** — strict by default, allowlist for enterprise intranets
-11. **Idempotent step execution** — ARQ retries skip completed steps
+11. **Idempotent step execution** — duplicate delivery/retry must not duplicate paid provider calls
 12. **Manual short-lived DB sessions** — no auto-transaction during LLM calls
 13. **Inline builder with hidden assistants** — one-page flow creation
 14. **Variable interpolation with JSON-safe escaping**
@@ -83,15 +83,18 @@ flows
 │     }
 │     Form field types: text | number | select | image | audio | document | file
 ├── space_id → spaces.id                    (CASCADE)
-├── user_id → users.id                      (CASCADE)
+├── created_by_user_id → users.id           (SET NULL)
+├── owner_user_id → users.id                (SET NULL)
 ├── tenant_id → tenants.id                  (CASCADE)
 ├── icon_id → icons.id                      (SET NULL)
+├── deleted_at: datetime | None             (soft delete default)
+├── UNIQUE(id, tenant_id)                   (required for composite tenant FK targets)
 └── steps: relationship → flow_steps        (viewonly, order_by step_order)
 
 flow_steps
 ├── id, created_at, updated_at              (BasePublic)
 ├── flow_id → flows.id                      (CASCADE)
-├── assistant_id → assistants.id            (CASCADE)
+├── assistant_id → assistants.id            (RESTRICT)
 │     Hidden (inline builder) or pre-existing (linked)
 ├── step_order: int
 ├── user_description: str | None
@@ -101,12 +104,20 @@ flow_steps
 │     Step 1 should default to flow_input.
 ├── input_type: str                         (default "any")
 │     text | json | image | audio | document | file | any
+├── input_contract: JSONB | None
+│     Canonical input schema/type contract.
+│     Example: {"type":"json","schema":{"required":["summary"]}}
 ├── output_mode: str                        (default "pass_through")
 │     pass_through | http_post
 ├── output_type: str                        (default "text")
 │     V1: text | json | pdf | docx
 │     V2: image | audio (deferred — non-stream completion returns text only,
 │         generated media requires stream/event handling per P2-10)
+├── output_contract: JSONB | None
+│     Canonical output schema/type contract.
+├── input_bindings: JSONB | None
+│     Explicit binding map from allowed sources (`flow_input`, parent step outputs)
+│     into contract fields.
 ├── output_classification_override: int | None
 │     Use `is not None` check (Python: `0 or x` evaluates to x)
 ├── mcp_policy: str                         (default "inherit")
@@ -120,50 +131,147 @@ flow_steps
 │       Check for existing encryption before deciding. V2: mandate Fernet.
 ├── output_config: JSONB | None
 │     Same encryption policy as input_config headers
-└── UNIQUE(flow_id, step_order)
+├── UNIQUE(flow_id, step_order)
+└── UNIQUE(flow_id, id)                     (required by same-flow dependency composite FKs)
 
 flow_step_mcp_tools                         (membership-based allowlist)
 ├── flow_step_id → flow_steps.id (CASCADE)  PK
 └── mcp_server_tool_id → mcp_server_tools.id (CASCADE) PK
 
+flow_step_dependencies                      (DAG edges, same-flow only)
+├── flow_id → flows.id                      (CASCADE)
+├── parent_step_id → flow_steps.id          (CASCADE)
+├── child_step_id → flow_steps.id           (CASCADE)
+├── UNIQUE(flow_id, parent_step_id, child_step_id)
+├── CHECK(parent_step_id <> child_step_id)
+└── Composite FKs:
+      (flow_id, parent_step_id) → flow_steps(flow_id, id)
+      (flow_id, child_step_id)  → flow_steps(flow_id, id)
+
+flow_versions                               (immutable published snapshots)
+├── flow_id → flows.id                      (CASCADE)
+├── version: int                            (monotonic per flow)
+├── definition_checksum: str
+├── definition_json: JSONB
+│     Immutable runtime snapshot:
+│       flow metadata + ordered step definitions with
+│       step_id, step_order, assistant/model/prompt, MCP config,
+│       input/output configs, contracts, bindings, classification override
+├── created_at: datetime
+└── UNIQUE(flow_id, version)
+
 flow_runs
 ├── id, created_at, updated_at              (BasePublic)
 ├── flow_id → flows.id                      (CASCADE)
+├── tenant-flow integrity FK: (flow_id, tenant_id) → flows(id, tenant_id)
+├── flow_version: int                       (immutable execution pin)
+│     FK (flow_id, flow_version) → flow_versions(flow_id, version)
 ├── user_id → users.id                      (SET NULL)
 ├── tenant_id → tenants.id                  (CASCADE)
+├── status: str                             (queued | running | completed | failed | cancelled)
+├── cancelled_at: datetime | None
 ├── input_payload_json: JSONB | None
 │     {"text": "...", "file_ids": [...], "form_data": {"namn": "Anna", ...}}
 ├── output_payload_json: JSONB | None
 ├── error_message: str | None
 ├── job_id → jobs.id                        (SET NULL)
-│     Status derived from job.status (no separate column)
+│     Optional correlation id for shared job telemetry
+├── UNIQUE(id, tenant_id)                   (required for composite tenant FK targets)
+├── UNIQUE(id, flow_id)                     (required for same-flow execution FKs)
 └── step_results: relationship, job: relationship
 
 flow_step_results
 ├── id, created_at, updated_at              (BasePublic)
 ├── flow_run_id → flow_runs.id              (CASCADE)
-├── step_order: int
+├── flow_id → flows.id                      (CASCADE)
+├── tenant_id → tenants.id                  (CASCADE)
+├── tenant-run integrity FK: (flow_run_id, tenant_id) → flow_runs(id, tenant_id)
+├── same-flow run FK: (flow_run_id, flow_id) → flow_runs(id, flow_id)
+├── step_id → flow_steps.id                 (SET NULL)
+├── same-flow step FK: (flow_id, step_id) → flow_steps(flow_id, id)
+├── step_order: int (NOT NULL, display/sorting only)
 ├── assistant_id → assistants.id            (SET NULL)
 ├── input_payload_json: JSONB | None
+├── effective_prompt: str | None            (post-interpolation prompt sent to model)
 ├── output_payload_json: JSONB | None
 │     {"text":"...","file_ids":[...],"generated_file_ids":[...],"webhook_delivered":false}
+├── model_parameters_json: JSONB | None
+│     Resolved effective runtime parameters captured at execution time (not just configured defaults),
+│     e.g. {"model_id":"...","provider":"...","temperature":0.2,"top_p":1.0,"max_tokens":4096}
 ├── num_tokens_input: int | None
 ├── num_tokens_output: int | None
-├── status: str (default "pending")
+├── status: str (default "pending")         (pending | running | completed | failed | cancelled)
 ├── error_message: str | None
 ├── flow_step_execution_hash: str | None
 │     SHA256 over execution-critical fields only:
-│       assistant_id + prompt text + completion_model.id
+│       flow_run_id + step_id + flow_version
+│       + assistant_id + prompt text + completion_model.id
+│       + canonical_json(model runtime parameters: temperature/top_p/max_tokens)
 │       + mcp_policy + sorted(mcp_tool_allowlist when restricted)
 │       + input_source + canonical_json(input_config)
+│       + canonical_json(input_bindings)
 │       + output_mode + output_type + canonical_json(output_config)
 │       + output_classification_override
+│       + canonical_json(input_contract) + canonical_json(output_contract)
+│       + canonical normalized input-context hash
 │     Excludes cosmetic fields (`user_description`, labels/icons, timestamps).
+├── UNIQUE(flow_run_id, step_id)
 └── tool_calls_metadata: JSONB | None
 │     ⚠️ CODEBASE NOTE: Verify that tool_calls_metadata is populated for
 │     non-streaming calls in tenant_model_adapter.py. There may be a gap
 │     where streaming paths capture this but non-streaming (our path) does not.
+
+flow_step_attempts                          (append-only retry/attempt history)
+├── id, created_at                          (BasePublic)
+├── flow_run_id → flow_runs.id              (CASCADE)
+├── flow_id → flows.id                      (CASCADE)
+├── tenant_id → tenants.id                  (CASCADE)
+├── tenant-run integrity FK: (flow_run_id, tenant_id) → flow_runs(id, tenant_id)
+├── same-flow run FK: (flow_run_id, flow_id) → flow_runs(id, flow_id)
+├── step_id → flow_steps.id                 (SET NULL)
+├── same-flow step FK: (flow_id, step_id) → flow_steps(flow_id, id)
+├── step_order: int (NOT NULL, display/sorting only)
+├── attempt_no: int                         (1..n)
+│     Allocation contract: `MAX()+1` is forbidden.
+│     Use `self.request.retries + 1` (Celery-native) or a DB-atomic counter strategy.
+├── celery_task_id: str | None
+├── status: str                             (started | retried | failed | completed | cancelled)
+├── error_code: str | None
+├── error_message: str | None
+├── started_at: datetime
+├── finished_at: datetime | None
+└── UNIQUE(flow_run_id, step_id, attempt_no)
 ```
+
+**Constraint rationale:**
+- `step_id` in execution tables is a historical reference, not a structural dependency.
+- `SET NULL` on `step_id` avoids sibling-cascade ordering conflicts during tenant/space/flow deletes.
+- Tenant/run cascade still removes execution rows when deleting runs; `SET NULL` primarily protects integrity for step-definition lifecycle changes.
+- Denormalized `flow_id` on execution tables is intentional for DB-level same-flow integrity:
+  - result/attempt rows cannot reference a step from another flow even under service bugs.
+
+**Migration:** 1 ALTER (assistants.hidden) + 9 CREATE TABLE.
+
+### 1.2.1 Operational Indexes (required in migration set)
+
+- `flow_runs(flow_id, status)`
+- `flow_runs(tenant_id, created_at)`
+- `flow_step_results(flow_run_id, flow_id, step_id)`
+- `flow_step_attempts(flow_run_id, flow_id, step_id, attempt_no)`
+- `flows(space_id, deleted_at)`
+
+### 1.2.2 I/O Contract Schema (normative subset)
+
+- JSON payload contracts use a documented JSON Schema Draft-07 compatible subset:
+  - `type`, `required`, `properties`, `items`, `enum`, `additionalProperties`
+- Non-JSON contracts (`text`, `image`, `audio`, `document`, `file`) use typed envelope metadata:
+  - `type`, optional `format`, optional size/count constraints
+- `input_bindings` format:
+  - map of target fields to source expressions
+  - example: `{"summary":"{{step_2.output.summary}}","handler":"{{flow_input.handläggare}}"}` 
+- Validation responsibilities:
+  - publish-time: binding completeness, source existence, type compatibility
+  - run-time: output payload satisfies `output_contract`
 
 ### 1.3 Module Registry Table
 
@@ -185,7 +293,7 @@ module_registry
 ├── tenant_id → tenants.id, metadata_json: JSONB | None
 ```
 
-**Migration:** 1 ALTER (assistants.hidden) + 6 CREATE TABLE.
+**Migration:** 1 ALTER (assistants.hidden) + 9 CREATE TABLE.
 
 ---
 
@@ -199,14 +307,22 @@ module_registry
 class FlowRepository:
     """Dedicated repository for Flow aggregate. NOT inside SpaceRepository."""
 
-    async def create(self, flow: Flow) -> Flow: ...
-    async def get(self, flow_id: UUID) -> Flow: ...
-    async def get_by_space(self, space_id: UUID) -> list[Flow]: ...
-    async def get_sparse_by_space(self, space_id: UUID) -> list[FlowSparse]: ...
-    async def update(self, flow: Flow) -> Flow: ...
-    async def delete(self, flow_id: UUID) -> None: ...
-    async def get_step_result(self, flow_run_id, step_order) -> FlowStepResult | None: ...
-    async def save_step_result(self, flow_run_id, result: FlowStepResult) -> None: ...
+    # tenant_id is required in all repository methods (query-level tenant isolation).
+    async def create(self, flow: Flow, tenant_id: UUID) -> Flow: ...
+    async def get(self, flow_id: UUID, tenant_id: UUID) -> Flow: ...
+    async def get_by_space(self, space_id: UUID, tenant_id: UUID) -> list[Flow]: ...
+    async def get_sparse_by_space(self, space_id: UUID, tenant_id: UUID) -> list[FlowSparse]: ...
+    async def update(self, flow: Flow, tenant_id: UUID) -> Flow: ...
+    async def delete(self, flow_id: UUID, tenant_id: UUID) -> None: ...
+    async def get_step_result(self, flow_run_id: UUID, step_id: UUID, tenant_id: UUID) -> FlowStepResult | None: ...
+    async def get_step_result_by_order(self, flow_run_id: UUID, step_order: int, tenant_id: UUID) -> FlowStepResult | None: ...  # Legacy ARQ only
+    async def save_step_result(
+        self,
+        flow_run_id: UUID,
+        result: FlowStepResult,
+        tenant_id: UUID,
+        session: AsyncSession | None = None,
+    ) -> None: ...
 ```
 
 **Space integration:** Space entity holds `flows: list[FlowSparse]` for UI listing only (name, id, published, description). Loaded via `FlowRepository.get_sparse_by_space()` called during space hydration — NOT via `_set_flows()`.
@@ -298,6 +414,9 @@ def build_context(flow_run_params, all_results: list) -> dict:
                 step_ctx["output"] = parsed
         except (json.JSONDecodeError, ValueError):
             pass
+        # CRITICAL: Variable keys use step_order for human-readable prompts (e.g., {{step_1.output}}).
+        # Execution identity (hashing, DB uniqueness) strictly uses step_id.
+        # DAG phase migration note: keep human-readable step aliases stable across branches (do not expose UUIDs in prompts).
         context[f"step_{result.step_order}"] = step_ctx
     return context
 
@@ -335,7 +454,10 @@ def interpolate(text: str, context: dict, json_safe: bool = False) -> str:
 
 ---
 
-## 5. SequentialFlowRunner
+## 5. SequentialFlowRunner (Legacy ARQ Reference)
+
+This section remains as implementation history and codebase context.
+For current flow runtime orchestration and task lifecycle contracts, use Section 19.
 
 ### Worker Transaction Isolation
 
@@ -353,11 +475,11 @@ class SequentialFlowRunner:
         self.session_factory = session_factory  # creates short-lived DB sessions
         self.doc_generator = doc_generator
 
-    async def _persist_step_result(self, flow_run_id, step_result):
+    async def _persist_step_result(self, flow_run_id, step_result, tenant_id):
         """Open a short-lived DB session, save, commit, close."""
         async with self.session_factory() as session:
             await self.flow_repo.save_step_result(
-                flow_run_id, step_result, session=session
+                flow_run_id, step_result, tenant_id=tenant_id, session=session
             )
             await session.commit()
         # Session closed — connection returned to pool immediately
@@ -369,7 +491,9 @@ class SequentialFlowRunner:
 
         for step in sorted(flow.steps, key=lambda s: s.step_order):
             # ── Idempotency check (ARQ retry safety) ──
-            existing = await self._get_step_result(flow_run_id, step.step_order)
+            # Legacy ARQ reference: lookup by step_order.
+            # Current Celery runtime MUST use get_step_result(run_id, step_id, tenant_id).
+            existing = await self._get_step_result(flow_run_id, step.step_order, tenant_id=user.tenant_id)
             if existing and existing.status == "completed":
                 if step.output_mode == "http_post" and step.output_config:
                     delivered = (existing.output_payload_json or {}).get("webhook_delivered", False)
@@ -378,7 +502,7 @@ class SequentialFlowRunner:
                         headers = self._decrypt_headers(step.output_config.get("headers", {}))
                         await self._safe_http_post(url, headers, existing.output_payload_json.get("text", ""))
                         existing.output_payload_json["webhook_delivered"] = True
-                        await self._persist_step_result(flow_run_id, existing)
+                        await self._persist_step_result(flow_run_id, existing, tenant_id=user.tenant_id)
                 previous_result = existing
                 all_results.append(existing)
                 context = build_context(flow_run_params, all_results)
@@ -424,21 +548,23 @@ class SequentialFlowRunner:
                     step_order=step.step_order,
                     assistant_id=step.assistant.id,
                     input_payload_json={"text": current_text, "file_ids": current_file_ids},
+                    effective_prompt=resolved_prompt,
                     output_payload_json={
                         "text": out_text, "file_ids": out_file_ids,
                         "generated_file_ids": out_file_ids,
                         "webhook_delivered": False,
                     },
+                    model_parameters_json=get_effective_model_parameters(step.assistant),
                     num_tokens_input=result.num_tokens_input,
                     num_tokens_output=result.num_tokens_output,
                     tool_calls_metadata=result.tool_calls_metadata,
                     status="completed",
                 )
                 try:
-                    await self._persist_step_result(flow_run_id, step_result)
+                    await self._persist_step_result(flow_run_id, step_result, tenant_id=user.tenant_id)
                 except Exception:
                     for fid in out_file_ids:
-                        await self.file_service.delete_file(fid)
+                        await self.file_service.delete_file_system(fid, tenant_id=user.tenant_id)
                     raise
 
                 # ── 8. Webhook ──
@@ -448,7 +574,7 @@ class SequentialFlowRunner:
                         headers = self._decrypt_headers(step.output_config.get("headers", {}))
                         await self._safe_http_post(url, headers, out_text)
                         step_result.output_payload_json["webhook_delivered"] = True
-                        await self._persist_step_result(flow_run_id, step_result)
+                        await self._persist_step_result(flow_run_id, step_result, tenant_id=user.tenant_id)
                     except Exception as e:
                         raise FlowStepError(f"Step {step.step_order}: webhook failed: {e}")
 
@@ -462,9 +588,18 @@ class SequentialFlowRunner:
                     step_order=step.step_order, assistant_id=step.assistant.id,
                     input_payload_json={"text": current_text, "file_ids": current_file_ids},
                     status="failed", error_message=str(e))
-                await self._persist_step_result(flow_run_id, failed)
+                await self._persist_step_result(flow_run_id, failed, tenant_id=user.tenant_id)
                 raise
 ```
+
+**Warning (anti-pattern to avoid in new implementation):**
+Do not overwrite or duplicate a completed LLM step when webhook delivery fails.
+Use this contract in the Celery flow runtime:
+- keep step result `completed` with `webhook_delivered=false` and `webhook_error`
+- fail the flow run (or delivery subtask) for retry visibility
+- preserve completed LLM output for deterministic resume/retry
+
+Current canonical execution identity is `step_id`. `step_order` is retained as a non-null display/sorting field.
 
 ### MCP Tool Resolution
 
@@ -519,40 +654,62 @@ async def get_flow_graph(id: UUID, flow_service: FlowService = Depends()):
 
     for step in sorted(flow.steps, key=lambda s: s.step_order):
         nodes.append({
-            "id": f"step_{step.step_order}",
+            "id": str(step.id),
             "label": step.user_description or f"Steg {step.step_order}",
             "type": "llm",
             "model": step.assistant.completion_model.name if step.assistant else None,
+            "step_order": step.step_order,
             "input_source": step.input_source,
             "input_type": step.input_type,
             "output_type": step.output_type,
             "has_webhook": step.output_mode == "http_post",
             "has_http_input": step.input_source in ("http_get", "http_post"),
             "mcp_policy": step.mcp_policy,
+            "classification": (step.output_classification_override
+                               if step.output_classification_override is not None
+                               else (step.assistant.completion_model.security_classification.security_level
+                                     if step.assistant else None)),
         })
 
     nodes.append({"id": "output", "label": "Resultat", "type": "output"})
 
     edges = []
     for step in sorted(flow.steps, key=lambda s: s.step_order):
-        sid = f"step_{step.step_order}"
+        sid = str(step.id)
         if step.step_order == 1:
             if step.input_source in ("flow_input", "http_get", "http_post"):
                 edges.append({"source": "input", "target": sid})
         if step.input_source == "previous_step" and step.step_order > 1:
-            edges.append({"source": f"step_{step.step_order - 1}", "target": sid})
+            prev = next((s for s in flow.steps if s.step_order == step.step_order - 1), None)
+            if prev:
+                edges.append({"source": str(prev.id), "target": sid})
         elif step.input_source == "all_previous_steps":
             for prev in flow.steps:
                 if prev.step_order < step.step_order:
-                    edges.append({"source": f"step_{prev.step_order}", "target": sid,
+                    edges.append({"source": str(prev.id), "target": sid,
                                   "style": "dashed", "label": "aggregated"})
             edges.append({"source": "input", "target": sid, "style": "dashed"})
 
-    last_step = max(s.step_order for s in flow.steps) if flow.steps else 0
-    edges.append({"source": f"step_{last_step}", "target": "output"})
+    if flow.steps:
+        last_step = max(flow.steps, key=lambda s: s.step_order)
+        edges.append({"source": str(last_step.id), "target": "output"})
 
     return {"nodes": nodes, "edges": edges}
 ```
+
+---
+
+### 6.1 Run Evidence Export Endpoint
+
+`GET /api/v1/flow-runs/{id}/evidence`
+
+- tenant-scoped, read-only endpoint
+- returns:
+  - run envelope (`flow_run_id`, `tenant_id`, `flow_id`, `flow_version`, status, timestamps)
+  - immutable `flow_versions.definition_json` snapshot
+  - step results (`input_payload_json`, `effective_prompt`, `output_payload_json`, `model_parameters_json`, tokens, status/errors, `tool_calls_metadata`)
+  - attempt history (`flow_step_attempts`)
+- V1 scope: tool traces required; knowledge retrieval refs included only if already available from existing metadata paths
 
 ---
 
@@ -568,13 +725,16 @@ async def get_flow_graph(id: UUID, flow_service: FlowService = Depends()):
 
 ---
 
-## 9. Worker Task
+## 9. Worker Task (Legacy ARQ Reference)
+
+This section is preserved as historical implementation context from the baseline plan.
+For current flow runtime implementation, follow Section 19 (Celery Sub-Track).
 
 **P0-1:** `worker.py:445` — `@worker.task` wraps the full task in `session.begin()`. This means any LLM call (60+ seconds) holds a DB connection open.
 
 **P0-2:** `worker.py:431` — `@worker.task` decorator only accepts `with_user` and `channel_type`, NOT `timeout`.
 
-**Fix: Create `long_running_task` pattern** that does not auto-open a session. The runner uses `session_factory` for short-lived persist calls only. Timeout is configured at ARQ worker level (`job_timeout=1800` in ARQ settings), not in the decorator.
+**Legacy fix context:** Create `long_running_task` pattern that does not auto-open a session. The runner uses `session_factory` for short-lived persist calls only. Timeout is configured at ARQ worker level (`job_timeout=1800` in ARQ settings), not in the decorator.
 
 ```python
 # Option A: New decorator that skips session.begin()
@@ -606,12 +766,19 @@ async def run_flow(params: FlowRunParams, container, worker_config):
 
 ---
 
-## 10. Cleanup Jobs
+## 10. Cleanup Jobs (Legacy + Current Flow Runtime Notes)
 
-**Active cancellation:** `arq_redis.abort_job()` on DELETE.
+**Active cancellation (legacy ARQ path):** `arq_redis.abort_job()` on DELETE.
+**Active cancellation (current Celery flow path):** idempotent cancel state transition + revoke pending task IDs + running-step cancel checks before side effects.
 **Zombie cleanup (hourly):** 2h threshold.
 **Hidden assistant cleanup (hourly):** Delete orphans with no flow_step reference.
-**Data retention:** `delete_old_flow_runs()` with `generated_file_ids` GC.
+**Data retention (policy-driven):** `delete_old_flow_runs()` with `generated_file_ids` GC under explicit admin retention policy.
+**No random purge rule:** artifacts referenced by completed step results are treated as auditable/business data and are never removed by technical orphan GC.
+**Orphan artifact cleanup (technical garbage only):**
+- generated artifacts are tagged at creation with `tenant_id`, `flow_run_id`, `flow_id`, `created_at`, optional `step_id`
+- hourly sweep uses configurable `orphan_grace_minutes` (default `60`)
+- delete only when age > grace AND (`flow_run_id` missing OR run is `failed|cancelled`) AND artifact is not referenced by any completed step result
+- all deletions must use tenant-scoped system path: `delete_file_system(file_id, tenant_id)`
 **P1-9:** `FileService.delete_file` enforces owner check (`file_service.py:93`). Flow cleanup job running as system can't delete user-uploaded flow files. **Fix:** Add `delete_file_system(file_id, tenant_id)` — tenant-scoped system GC path that bypasses user ownership but requires tenant authorization.
 
 ### Flow Validation (API time)
@@ -621,6 +788,10 @@ async def run_flow(params: FlowRunParams, container, worker_config):
 - If `step_order == 1`: reject `previous_step` and `all_previous_steps`. Default to `flow_input`.
 - If `step_order > 1` and `input_source == "flow_input"`: allowed (step re-reads original form data).
 - If `step_order > 1` and `input_source == "http_get|http_post"`: allowed (external fetch).
+- Linear phase guardrail (until DAG phase):
+  - reject graphs where any step has `in_degree > 1`
+  - reject graphs where any step has `out_degree > 1`
+  - reject disconnected subgraphs
 
 ---
 
@@ -843,7 +1014,8 @@ frontend/apps/web/src/lib/features/flows/components/
 - Classification badge: "K3" / "K2" / "K1" colored chip if security_enabled
 
 **Stateful visualizer (when viewing a completed FlowRun):**
-When Översikt is opened from a specific run result (not the editor), pass `?run_id=` to the graph endpoint. The endpoint enriches nodes with execution data:
+When Översikt is opened from a specific run result (not the editor), pass `?run_id=` to the graph endpoint.
+The endpoint must load `flow_runs.flow_version` and build nodes/edges from `flow_versions.definition_json` (immutable snapshot), then enrich those nodes with execution data:
 - Completed steps → green nodes with execution time ("2.3s") and token count
 - Failed steps → red nodes with error summary
 - Skipped steps (retry) → gray nodes
@@ -852,19 +1024,27 @@ When Översikt is opened from a specific run result (not the editor), pass `?run
 **Graph endpoint with run data** (`GET /api/v1/flows/{id}/graph?run_id=xxx`):
 ```python
 if run_id:
-    step_results = await flow_repo.get_step_results(run_id)
-    for node in nodes:
-        if node["type"] == "llm":
-            result = next((r for r in step_results if f"step_{r.step_order}" == node["id"]), None)
-            if result:
-                node["status"] = result.status
-                node["execution_time_ms"] = (result.updated_at - result.created_at).total_seconds() * 1000
-                node["tokens"] = {"input": result.num_tokens_input, "output": result.num_tokens_output}
-                node["error"] = result.error_message
+    run = await flow_run_service.get(run_id=run_id, flow_id=id)
+    snapshot = await flow_version_repo.get(flow_id=run.flow_id, version=run.flow_version)
+    definition = snapshot.definition_json
+    nodes, edges = build_graph_from_definition(definition)  # version-pinned graph
+    step_results = await flow_repo.get_step_results(run_id=run_id, tenant_id=run.tenant_id)
+    nodes = enrich_nodes_with_run_results(nodes, step_results)
+else:
+    flow = await flow_service.get(id)  # live definition
+    nodes, edges = build_graph_from_live_flow(flow)
 ```
 
 **Export buttons:**
 - "Ladda ner flöde (JSON)" → full flow definition for compliance audit
+  - if `run_id` is present: export the version-pinned snapshot (`flow_versions.definition_json`)
+  - else: export the current draft/live definition
+- "Ladda ner körningsunderlag (JSON)" (run context only) → audit evidence package:
+  - backed by `GET /api/v1/flow-runs/{id}/evidence`
+  - run metadata (`flow_run_id`, `tenant_id`, `flow_id`, `flow_version`, status, timestamps)
+  - input envelope (policy-redacted where required)
+  - per-step evidence: `effective_prompt`, model/provider, `model_parameters_json`, outputs/artifacts, token/latency, error metadata, tool traces
+  - knowledge retrieval refs: optional in V1 (include when available; no additional runtime capture subsystem required)
 - "Ladda ner diagram (PNG)" → uses `html-to-image` library (`toBlob()` on the Svelte Flow wrapper DOM ref). Captures exact layout and CSS without backend rendering.
 - "Ladda ner diagram (SVG)" → SVG export for print/reports
 
@@ -877,7 +1057,18 @@ if run_id:
 5. If generated from a specific run: execution times, token counts, pass/fail per step
 This is what municipal auditors need when evaluating automated AI decision-making.
 
+**Audit evidence preservation requirement:**
+- referenced run evidence artifacts are retained for auditability and are not removed by technical orphan GC.
+- purge of referenced evidence artifacts follows explicit admin retention/legal policy only.
+
 **Package:** `npm install @xyflow/svelte dagre @dagrejs/dagre html-to-image`
+
+**Dry Run Preview (Minimal V1):**
+- compile-time preview only
+- validates `input_bindings`, required inputs, model availability, classification compatibility
+- renders expected execution path + per-step input source/output type on the existing Svelte Flow graph
+- used for debugging/explainability before real execution
+- MUST NOT execute HTTP calls, MCP tool invocations, model completions, or webhook deliveries
 
 ### Admin: Module Registry UI (unchanged)
 
@@ -889,7 +1080,10 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - `FlowFactory`, `FlowRunFactory`
 - `FlowAssembler`, `FlowRunAssembler`
 - `FlowService`, `FlowRunService`, `ModuleService`
-- `SequentialFlowRunner(assistant_service, flow_repo, file_service, session_factory)`
+- `FlowCompiler` (pure definition -> Celery signature compiler)
+- `FlowExecutionBackend` (runtime boundary interface)
+- `CeleryFlowExecutionBackend` (FlowExecutionBackend implementation)
+- `SequentialFlowRunner(...)` retained only as historical reference during migration docs window
 - `HealthChecker(module_service)`
 
 ---
@@ -897,9 +1091,11 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 ## 16. PR Sequence
 
 ### PR 1: Data + Domain Foundations
-- Alembic migration: 1 ALTER + 6 CREATE
+- Alembic migration: 1 ALTER + 9 CREATE
+- Migration ordering rule: create base tables in dependency order first, then apply composite FKs/unique constraints.
 - Flow domain entities/factories
 - **FlowRepository** (own aggregate root, NOT in space_repo)
+- `flow_step_results` evidence fields: `effective_prompt`, `model_parameters_json`
 - Module registry entity/service
 - Space: FlowSparse references only (read via FlowRepository)
 - Permissions, hidden assistant filter
@@ -908,18 +1104,28 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 ### PR 2: Flow APIs + Execution Engine
 - Routers/models/assemblers + API Key v2 wiring
 - **Graph endpoint** (`GET /flows/{id}/graph`)
+- **Evidence endpoint** (`GET /api/v1/flow-runs/{id}/evidence`) for audit/debug export
 - **Resume endpoint** (`POST /flow-runs/{id}/resume`) with deterministic execution-hash checks
+  - only `failed` runs are resumable; `cancelled` runs are terminal (new run required)
 - `execute_once()` + `mcp_servers_override` + `prompt_override`
 - `_safe_copy()` for MCP entity cloning
-- SequentialFlowRunner with: **manual session factory**, variable resolver (with JSON-safe escaping), idempotent steps, token pre-check
+- Flow runtime boundary + compiler contracts:
+  - `FlowExecutionBackend`
+  - `FlowCompiler`
+- Legacy ARQ runner content remains reference-only; runtime target is Celery flow executor
 - SSRF + http_get + http_post input
 - Classification validation + egress check
 - Header encryption (if existing utility) or documented plaintext
 
 ### PR 3: Worker + Jobs + WebSocket + Cleanup
-- ARQ task (**explicit transaction isolation**, 30 min timeout)
+- Celery flow runtime foundation:
+  - Celery app + queue routing for `flows.execute`
+  - worker entrypoint for `celery-worker-flows`
+  - async bridge pattern (persistent runtime per worker child; no per-task `asyncio.run()`)
+  - lifecycle hooks (`on_retry`, `on_failure`)
 - WebSocket channel
-- Job cancellation, zombie cleanup, orphan assistant cleanup
+- Flow cancellation, stale-run reconciliation, orphan assistant cleanup
+- Keep ARQ worker unchanged for non-flow jobs
 
 ### PR 4: Frontend — Flow Builder + Översikt
 - intric-js endpoints + types
@@ -927,6 +1133,7 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - Inline builder (FlowStepCard, FlowStepList, FlowFormBuilder, FlowRunForm)
 - Variable autocomplete, step compatibility indicators
 - **Översikt tab: Svelte Flow visualizer** (read-only)
+- **Dry Run preview (minimal):** compile-time validation overlay, zero provider calls
 - **Export buttons:** JSON, PNG, SVG
 - API Key dialog: Flöden card
 - Translations
@@ -968,6 +1175,13 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - [ ] `_persist_step_result` opens + commits + closes in milliseconds
 - [ ] 3 concurrent flow runs don't exhaust connection pool
 
+### Celery Runtime Correctness
+- [ ] Linear phase rejects branch/join graphs at publish and run start
+- [ ] Chord prerequisites enforced (`ignore_result=False` for chord tasks + result backend enabled)
+- [ ] `on_failure` always transitions run to terminal state
+- [ ] Cancellation is idempotent and revokes pending task IDs
+- [ ] Stale-run reconciler closes stuck `running` runs
+
 ### Entity Cloning
 - [ ] `_safe_copy()` works for MCP servers (test both Pydantic + domain entity paths)
 - [ ] No DetachedInstanceError from SQLAlchemy-loaded objects
@@ -983,6 +1197,7 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - [ ] Cosmetic edits (`user_description`, labels, timestamps) do NOT force full rerun
 - [ ] Upstream logic change forces full rerun from step 1
 - [ ] No upstream change resumes from first failed step
+- [ ] Cancelled runs are terminal and non-resumable (retry via new run only)
 
 ### Auth Broker
 - [ ] Module login succeeds via broker ticket handoff (`handoff_state` verified)
@@ -1013,6 +1228,250 @@ This is what municipal auditors need when evaluating automated AI decision-makin
 - Graph endpoint is lightweight (no separate table, computed from flow data)
 - Auth Broker + Ticket Handoff is the production default (no shared cookie)
 - Redis is available for ticket storage and atomic consume-once
+- Redis keyspaces are isolated for:
+  - auth ticket/state data
+  - Celery broker messages
+  - Celery result backend
+- Redis eviction policy for production flow runtime is `noeviction` (avoid silent task/ticket loss)
 - No IdP per-module redirect URI registration required (broker centralizes this)
 - Module-scoped JWT prevents blast-radius escalation from compromised modules
 - Docker Compose is the primary deployment model for municipal operations
+
+---
+
+## 19. Celery Sub-Track for Flows (Additive to Unified 7-PR Program)
+
+This sub-track is additive to the existing 7-PR program and supersedes ARQ-specific flow execution internals only.
+
+### 19.1 Scope split
+
+- Flows: Celery runtime.
+- Existing non-flow jobs: ARQ unchanged.
+
+### 19.2 Flow runtime contracts
+
+- `FlowExecutionBackend` and `FlowCompiler` are required internal interfaces.
+- Orchestration:
+  - Linear: `chain`
+  - DAG phase: `group/chord`
+- Chord prerequisite:
+  - result backend enabled
+  - chord-participating tasks with `ignore_result=False`
+
+### 19.3 Reliability contracts
+
+- `on_retry` + `on_failure` lifecycle hooks mandatory.
+- Chord errback failure propagation mandatory.
+- Canonical state machine is defined in `ARCHITECTURE.md` Part 16.3.1 and must be implemented exactly.
+- If this section conflicts with Part 16.3.1, Part 16.3.1 is authoritative.
+- Async runtime contract:
+  - persistent async runtime per Celery worker child
+  - no per-task `asyncio.run()`
+- Worker preflight contract (before provider/API side effects):
+  - reload run + flow with tenant scope
+  - if `flow.deleted_at IS NOT NULL`, exit without provider call
+  - if run is already terminal (`completed|failed|cancelled`), exit as no-op
+- Soft-delete runtime policy:
+  - no new provider calls after `flow.deleted_at` is set
+  - in-flight provider calls may complete once
+  - finalizer/reconciler closes the run with deterministic terminal reason
+- Pre-seed contract (CAS safety):
+  - at run creation, insert one `flow_step_results` row with `status='pending'` per step
+  - CAS claim targets the pre-seeded row; zero-row update means the step is already owned
+- Step claim contract (redelivery-safe):
+  - claim step via atomic CAS update (`pending|failed -> running`)
+  - if CAS rowcount is zero, worker must exit immediately (another worker already owns outcome)
+- Transaction boundary rule:
+  - CAS claim, `flow_step_attempts` insert, and run/step timing updates commit in one DB transaction
+- Status ownership rule:
+  - `retried` is attempt-level only (`flow_step_attempts`), not a `flow_step_results` status
+- Attempt numbering contract:
+  - forbid `MAX()+1` in concurrent workers
+  - derive `attempt_no` from `self.request.retries + 1` or equivalent DB-atomic increment strategy
+- Cancellation contract:
+  - idempotent cancel
+  - pending task revoke
+  - running-step cancel check before side effects
+  - cancelled run remains terminal/non-resumable; retry requires a new run
+- Webhook failure split:
+  - keep LLM step result `completed`
+  - persist delivery failure metadata (`webhook_delivered=false`, error details)
+  - fail run/delivery path without losing completed model output
+- Stale-run reconciler mandatory for hard-crash paths.
+- Broker/result visibility timeout is explicitly configured and consistent across:
+  - broker transport options
+  - result backend transport options
+  - app visibility timeout
+
+### 19.4 Flow DB integrity checkpoints
+
+- `flow_versions` immutable definitions and run pinning FK.
+- `flow_step_attempts` append-only retry history.
+- `flow_step_dependencies(flow_id, parent_step_id, child_step_id)` with same-flow composite FKs.
+- Composite tenant FK safeguards on execution tables:
+  - `flow_runs(flow_id, tenant_id) -> flows(id, tenant_id)`
+  - `flow_step_results(flow_run_id, tenant_id) -> flow_runs(id, tenant_id)`
+  - `flow_step_attempts(flow_run_id, tenant_id) -> flow_runs(id, tenant_id)`
+- Composite same-flow safeguards on execution tables:
+  - execution rows include denormalized `flow_id`
+  - `flow_step_results(flow_run_id, flow_id) -> flow_runs(id, flow_id)`
+  - `flow_step_attempts(flow_run_id, flow_id) -> flow_runs(id, flow_id)`
+  - `(flow_id, step_id) -> flow_steps(flow_id, id)` (when `step_id` is not null)
+- SQL requirement for composite FK targets:
+  - `flows` exposes `UNIQUE(id, tenant_id)`
+  - `flow_runs` exposes `UNIQUE(id, tenant_id)`
+  - `flow_runs` exposes `UNIQUE(id, flow_id)`
+- Execution identity uses `step_id`; `step_order` remains non-null denormalized display metadata.
+- Multi-tenant scope control:
+  - use composite FK integrity as mandatory baseline
+  - require tenant-scoped repository queries on all flow execution paths
+  - defer RLS/trigger policy layers unless explicitly required by compliance/security scope
+- Soft-delete-safe uniqueness (partial unique indexes) and terminal-state check constraints.
+
+### 19.5 I/O contract checkpoints
+
+- Add definition-level `input_contract`, `output_contract`, `input_bindings`.
+- `input_bindings` is compile-time wiring for `FlowCompiler`.
+- `{{...}}` interpolation is runtime templating after bound input context is resolved.
+- Publish-time compatibility checks and run-time output schema checks.
+- Bounded inline payload policy + artifact-reference path for large outputs:
+  - `max_inline_text_bytes = 1_048_576` (1 MiB)
+  - `max_inline_json_bytes = 1_048_576` (1 MiB serialized JSON)
+  - `max_inline_preview_bytes = 16_384` (16 KiB preview)
+  - above cap: store artifact (`FileService`) and return typed reference + truncation metadata
+  - enforce caps immediately after model response, before websocket broadcast, logging, and persistence
+- Artifact integrity/cleanup checkpoints:
+  - generated artifacts are tagged at creation (`tenant_id`, `flow_run_id`, `flow_id`, `created_at`, optional `step_id`)
+  - orphan sweep is technical cleanup only; it does not purge referenced auditable artifacts
+  - orphan criteria: older than `orphan_grace_minutes` (default `60`) AND missing/terminal run (`failed|cancelled`) AND no completed-step reference
+  - retention purge of referenced artifacts follows explicit admin policy, not runtime sweeper heuristics
+- Audit evidence checkpoints:
+  - run-context evidence export includes version-pinned definition + run/step evidence package
+  - step evidence includes `effective_prompt` + `model_parameters_json` runtime snapshot
+  - tool traces included (`tool_calls_metadata`); knowledge retrieval refs optional in V1 (include when available)
+  - no standalone evidence-schema-version requirement in V1
+  - no separate runtime provenance store in V1 (derive lineage from `definition_json` + `input_bindings`)
+
+### 19.6 Phase overlay
+
+- Phase 1 (foundation): Celery app/worker topology, async bridge, queue wiring, DB pool guardrails.
+- Phase 2 (linear launch): Celery `chain` only + linear graph guardrail.
+- Phase 3 (ops/canary): health/alerting/stale-run reconciliation + queue/worker visibility (Flower or equivalent metrics).
+- Phase 4 (DAG enablement): `group/chord`, chord errbacks, outbox+beat.
+
+### 19.7 Mapping to PR sequence
+
+- PR 1: schema foundations (`created_by_user_id`, `owner_user_id`, `flow_versions`, `flow_step_dependencies`, `flow_step_attempts`, `step_id`-based execution keys, composite tenant FKs, composite same-flow FKs on execution tables, contracts/bindings fields, `effective_prompt`, `model_parameters_json`).
+- PR 2: flow service contracts (`FlowCompiler`, `FlowExecutionBackend`) and publish-time validation.
+- PR 3: Celery worker/bootstrap + queue routing + lifecycle hooks + cancellation/reconciliation.
+- PR 4: UI guardrails (linear-only validation messaging in Phase A) + graph clarity.
+- PR 7: hardening/retention/index tuning + DAG enablement prep.
+
+### 19.8 Unit test gates (must pass before integration)
+
+- Compiler tests:
+  - linear definition -> expected `chain` signature shape
+  - branch/join definition -> rejected in linear phase
+  - DAG-enabled definition -> expected `group/chord` signature shape
+- Hash/idempotency tests:
+  - cosmetic edits do not change hash
+  - execution-critical edits change hash
+  - duplicate delivery does not duplicate provider execution
+- Contract tests:
+  - publish rejects unresolved or type-incompatible `input_bindings`
+  - run rejects output violating declared `output_contract`
+  - dry-run preview returns validation results without provider/tool execution
+- Lifecycle tests:
+  - retry path records `flow_step_attempts`
+  - terminal failure path updates `flow_runs.status=failed`
+  - cancel path is idempotent and blocks side effects after cancel
+  - invalid transitions are rejected (for example `completed -> running`, `cancelled -> running`)
+  - CAS claim test: second concurrent claimant exits without provider call
+  - attempt numbering test: no `MAX()+1`; concurrent retries produce unique `(flow_run_id, step_id, attempt_no)`
+  - soft-delete preflight test: queued task exits before provider call when flow is soft-deleted
+  - orphan sweep keeps artifacts referenced by completed steps, even when run is failed/cancelled
+  - orphan sweep deletes unreferenced artifact when `flow_run_id` is missing and artifact age > grace
+  - audit evidence export for `run_id` is version-pinned and includes per-step prompt/model/params/output metadata
+  - audit evidence contains `effective_prompt` and `model_parameters_json` for completed steps
+
+### 19.9 Integration test gates (environment-backed)
+
+- Queue/runtime tests:
+  - long-running step fairness with `task_acks_late=True` + `worker_prefetch_multiplier=1`
+  - visibility-timeout config consistent across broker/backend/app
+- Reliability tests:
+  - forced worker kill -> redelivery + idempotent behavior
+  - retries exhausted -> deterministic terminal failure persisted
+  - stale-run reconciler marks stuck `running` runs as `failed`
+  - overlapping redelivery race -> single billed provider call (CAS winner only)
+  - startup guard rejects config where Redis DB indexes collide across ARQ/Celery/auth keyspaces
+  - payload overflow -> artifact fallback path with bounded inline preview
+  - crash-window test: artifact created then worker killed before step-result persist -> orphan sweep deletes after grace
+- Security/isolation tests:
+  - context rehydration enforces tenant + same-flow constraints
+  - cross-flow dependency insert blocked at DB layer
+  - chord callback failure surfaces root-cause and closes run
+  - evidence export endpoint rejects cross-tenant access and only returns tenant-scoped run artifacts
+
+### 19.10 Ops confirmation gates (canary -> widen)
+
+- Canary only for tenant allowlist while tracking:
+  - run success rate
+  - median/p95 step latency
+  - retry rate and terminal failure rate
+- Exit criteria to widen rollout:
+  - no silent-running incidents
+  - no cross-tenant/cross-flow integrity violations
+  - no queue starvation under representative concurrent load
+  - Redis memory pressure alerts are active (`used_memory` threshold + write rejection on `noeviction`)
+  - ARQ and Celery workers expose monitored heartbeat/liveness signals
+
+### 19.11 Locked Worker Ownership Split (current migration window)
+
+- Flows and flow-module execution path:
+  - Module/UI -> Backend Flow APIs -> `FlowCompiler` -> Celery flow worker (`flows.execute`)
+- Legacy non-flow workloads:
+  - ARQ worker remains the execution path until each domain is explicitly migrated
+- Migration policy:
+  - do not implement new flow execution logic in ARQ
+  - do not move legacy ARQ workloads to Celery without explicit migration design + tests
+
+### 19.12 Context7-Verified Celery References (authoritative)
+
+- Canvas orchestration (`chain`, `group`, `chord`) and chord error semantics:
+  - [Celery Canvas User Guide](https://docs.celeryq.dev/en/stable/userguide/canvas/)
+- Chord prerequisite (`ignore_result=False` on chord tasks + enabled result backend):
+  - [Celery Canvas Important Notes](https://docs.celeryq.dev/en/stable/userguide/canvas/)
+- Long-running fairness and redelivery model (`task_acks_late`, `worker_prefetch_multiplier=1`):
+  - [Celery Optimizing Guide](https://docs.celeryq.dev/en/stable/userguide/optimizing/)
+- Redis visibility timeout consistency across broker/backend/app:
+  - [Celery Redis Broker/Backend Guide](https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/redis.html)
+- Periodic orchestration support for DAG-phase outbox sweeper:
+  - [Celery Periodic Tasks](https://docs.celeryq.dev/en/stable/userguide/periodic-tasks.html)
+
+---
+
+## 20. Parity Matrix (modulez baseline -> modulesdocs merged)
+
+| Critical domain area | Original location (`modulez`) | Merged location (`modulesdocs`) | Status |
+|---|---|---|---|
+| Auth Broker flow + endpoints | `IMPLEMENTATION.md` §13, `ARCHITECTURE.md` Part 3 | `IMPLEMENTATION.md` §13, `ARCHITECTURE.md` Part 3 | Preserved |
+| Module architecture / BFF contracts | `ARCHITECTURE.md` Part 2 | `ARCHITECTURE.md` Part 2 | Preserved |
+| Widget architecture | `ARCHITECTURE.md` Part 5, `IMPLEMENTATION.md` §12 | `ARCHITECTURE.md` Part 5, `IMPLEMENTATION.md` §12 | Preserved |
+| Security classification logic | `ARCHITECTURE.md` §6.9, `FLOW_EXECUTION_ENGINE.md` classification section | same sections + Celery overlay constraints | Preserved+Enhanced |
+| Flow data model and API endpoints | `IMPLEMENTATION.md` §1, §6; `FLOW_EXECUTION_ENGINE.md` Data Model | same sections + Celery/DB integrity overlay | Preserved+Enhanced |
+| P0/P1 codebase alignment fixes | `ARCHITECTURE.md` Part 12, `IMPLEMENTATION.md` §0, `FLOW_EXECUTION_ENGINE.md` Codebase Alignment | same sections retained | Preserved |
+| STT scenario walkthrough | `README.md` "The Scenario: Speech-to-Text" | same section retained | Preserved |
+| Compliance export / graph visualizer | `ARCHITECTURE.md` §6.11, `FLOW_EXECUTION_ENGINE.md` graph section, `IMPLEMENTATION.md` frontend section | same sections retained | Preserved |
+| MCP/SSRF/variable resolver | `FLOW_EXECUTION_ENGINE.md` resolver + SSRF + MCP sections | same sections retained + Celery runtime overlay | Preserved+Enhanced |
+| Celery runtime contracts and phased rollout | N/A (not first-class in baseline) | `ARCHITECTURE.md` Part 16, `FLOW_EXECUTION_ENGINE.md` Celery Runtime Overlay, `IMPLEMENTATION.md` §19 | Preserved+Enhanced |
+
+---
+
+## 21. Documentation QA Acceptance (Merge)
+
+1. All major baseline sections from `modulez` remain available in `modulesdocs`.
+2. Flow runtime supersedence is explicit where older ARQ-specific flow behavior existed.
+3. No module/auth/widget/compliance context has been removed.
+4. Celery additions are additive and decision-complete for flow runtime.
+5. `modulez` remains untouched as historical reference.
